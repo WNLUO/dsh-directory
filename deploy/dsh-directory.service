@@ -1,0 +1,18 @@
+[Unit]
+Description=DSH Directory (public relay control plane / address directory)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www
+Group=www
+WorkingDirectory=/opt/dsh-directory
+EnvironmentFile=/opt/dsh-directory/dsh-directory.env
+ExecStart=/opt/dsh-directory/dsh-directory
+Restart=always
+RestartSec=2
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
