@@ -40,63 +40,57 @@ cargo run --release
 
 健康检查：`GET /healthz` → `{"ok":true,"devices":N,"watchers":M}`。
 
-## 身份与令牌
+## 身份、加密与令牌
 
-令牌不是全局共享的，而是**每台设备一个**，由这台设备的插件和它的 APP 共用：
+两件事分开：**内容端到端加密**（总控看不到），**身份**用每设备一枚令牌（总控用来防冒充）。
 
-1. 设备用 `instanceId` 连上 `/ws/device` 注册。**首次注册**总控发一枚专属令牌；之后重连/覆盖
-   **必须带上同一枚令牌**，否则当冒充拒绝（插件把令牌落在 relay.json，重启也带得上）；
-2. 总控给这台设备发一个专属令牌（注册回包里带 `token`），插件把它存下来；
-3. 插件通过它和 APP 之间已有的那条连接，把令牌告诉 APP（这条链路不经过总控）；
-4. APP 拿着这枚令牌连 `/ws/app` 查 / 订阅这台设备。
+- 设备用 `instanceId` 连 `/ws/device`。**首次注册**总控发一枚专属令牌；之后重连/覆盖必须带上
+  同一枚，否则当冒充拒绝（插件把令牌落在 relay.json，重启也带得上）。
+- 上报的**载荷是密文**：插件用「实例历史密钥 HK」把全部连接地址封成信封（AES-256-GCM），AAD 为
+  `dsh-history-v1|control|<instanceId>`；总控只存这串密文、不持钥、解不开。
+- 插件把令牌经「插件↔APP」已有链路交给 APP；APP 用同一把 HK 解开载荷。HK 只在配对时下发给这台
+  设备的手机，总控永远拿不到。
 
-令牌只保护「查地址」这一侧：别人拿不到这枚令牌就查不到这台设备的地址。设备注册本身是开放的——
-谁知道某个 `instanceId` 就能为它注册/覆盖地址，所以 `instanceId` 要当作不可猜的随机串用。
-老用户升级插件后走的就是这条：APP 先连上插件，插件再从总控拿到令牌转交给它。
+令牌只保护「查/订阅」这一侧：拿不出令牌就查不到。载荷内容对总控不透明，所以哪怕有人知道
+instanceId，也只能看到一段解不开的密文。令牌随设备记录存在内存里，不随掉线删除，进程重启后
+清空（设备重连换新令牌，插件再同步给 APP）。
 
-令牌随设备记录存在内存里，**不随设备掉线删除**（重连要拿回同一个，APP 手里那枚才不会失效），
-进程重启后清空——设备重连会拿一枚新的，插件再同步给 APP 即可。
+## 端到端加密（总控是盲的）
+
+- 复用历史离线 blob 那套：HK（32 字节）+ AES-256-GCM，信封 `{v:1,z:0,n,c}`，两端逐字节一致
+  （插件 `lib/mirror/history-blob.cjs`、APP `services/viewmodels/history-blob.ts`）。
+- AAD 绑 `scope='control'` 与 `instanceId`：换设备、换用途都解不开，也防重放到别的实例。
+- **取舍**：总控既然解不开，就不能在服务端按地址做“挑哪台公用中转 / 编址”这类事——需要读地址的
+  逻辑只能放在插件 / APP 侧。总控在这里只当“保底查询”的盲存储。
 
 ## 协议（WebSocket + JSON）
 
-### 设备侧 `/ws/device?instanceId=<id>`
+### 设备侧 `/ws/device?instanceId=<id>[&token=<token>]`
 
-连上后先发 `register`，之后地址变化发 `update`（每次都是**整组**地址，不是增量）：
+连上后先发 `register`，之后载荷变化发 `update`（每次都是**整份**密文，不是增量）：
 
 ```json
-{ "type": "register", "addresses": [ { "kind": "relay", "url": "wss://relay.example/tunnel" },
-                                     { "kind": "lan",   "url": "http://192.168.1.5:49906" },
-                                     { "kind": "ipv6",  "url": "http://[fd00::5]:49906" } ] }
+{ "type": "register", "payload": "<加密信封 JSON 字符串>" }
+{ "type": "update",   "payload": "<加密信封 JSON 字符串>" }
 ```
 
-`kind` 可取 `relay` / `lan` / `ipv6` / `direct`，可省略。空地址、重复项在入库前被丢掉。
+`payload` 是 HK 封出来的信封（解开的明文形如 `{ "addresses": [ { "kind": "relay", "url": "..." } ] }`）。
+总控不解析它；单条上限 64KB。
 
-总控回：
-
-- `{"type":"registered","instanceId":"...","token":"..."}` — 注册成功，给出该设备令牌；
-- `{"type":"updated"}` — 一次 `update` 被收下；
-- `{"type":"error","message":"..."}` — 报文不合法 / 未先注册。
-
-连接断开 = 这台设备离线，订阅它的 APP 会收到离线事件。
+总控回：`registered`（带 `token`）/ `updated` / `error`。连接断开 = 设备离线，订阅者收到离线事件。
 
 ### APP 侧 `/ws/app?instanceId=<id>&token=<token>`
 
-令牌不对直接 401，连不上。连上后发：
-
-- `{"type":"query"}` — 查一次，回一份 `snapshot`；
-- `{"type":"watch"}` — 订阅：先回一份 `snapshot`，之后只在变化 / 掉线时推送；
-- `{"type":"unwatch"}` — 取消订阅。
-
-总控推给 APP：
+令牌不对直接 401。连上后发 `query` / `watch` / `unwatch`。总控推给 APP：
 
 ```json
-{ "type": "snapshot", "instanceId": "...", "online": true, "addresses": [ ... ] }
-{ "type": "update",   "instanceId": "...", "addresses": [ ... ] }   // 订阅期间地址变了
-{ "type": "offline",  "instanceId": "..." }                          // 订阅期间设备掉了
+{ "type": "snapshot", "instanceId": "...", "online": true, "payload": "<密文或 null>" }
+{ "type": "update",   "instanceId": "...", "payload": "<密文>" }
+{ "type": "offline",  "instanceId": "..." }
 ```
 
-**静默规则**：只有地址真的变了（比较时与顺序无关）才推 `update`；没变化不发任何东西，
-不靠定时心跳刷数据。设备重连把地址换个顺序不算变化。
+APP 用 HK 解 `payload`。**静默规则**：只有在明文地址真变化时设备才会重发（插件侧比较），总控不在
+服务端做去重；设备不发就没有推送。
 
 ## 防滥用与容量
 

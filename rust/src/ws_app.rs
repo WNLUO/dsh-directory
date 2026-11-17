@@ -1,7 +1,8 @@
 //! APP 侧长连接（`/ws/app`）。
 //!
 //! APP 拿着插件转交的令牌连上来，可以查一次（`query`），也可以订阅（`watch`）——
-//! 订阅后先给一份当前快照，之后只在地址变化 / 设备掉线时才收到推送，平时一个字都不发。
+//! 订阅后先给一份当前快照，之后只在载荷变化 / 设备掉线时才收到推送，平时一个字都不发。
+//! 推送里是密文载荷，APP 用自己那份 HK 解。
 
 use axum::{
     extract::{
@@ -86,13 +87,12 @@ async fn handle(socket: WebSocket, state: AppState, instance_id: String, ip: Str
         };
         match serde_json::from_str::<AppIn>(&text) {
             Ok(AppIn::Query) => {
-                let (online, addresses) = snapshot(&state, &instance_id).await;
-                send_snapshot(&tx, &instance_id, online, addresses);
+                let (online, payload) = snapshot(&state, &instance_id).await;
+                send_snapshot(&tx, &instance_id, online, payload);
             }
             Ok(AppIn::Watch) => {
-                // 注册订阅、刷新关注时间、读取当前快照，一次性在同一把写锁里完成：
-                // 中间不会有更新漏掉，也不会被清理逻辑当成「没人查」。
-                let (online, addresses) = {
+                // 注册订阅、刷新关注时间、读取当前载荷，一次性在同一把写锁里完成。
+                let (online, payload) = {
                     let mut g = state.inner.write().await;
                     let now = now_secs();
                     g.watchers
@@ -102,13 +102,13 @@ async fn handle(socket: WebSocket, state: AppState, instance_id: String, ip: Str
                     match g.devices.get_mut(&instance_id) {
                         Some(entry) => {
                             entry.last_app_interest = now;
-                            (true, entry.addresses.clone())
+                            (true, Some(entry.payload.clone()))
                         }
-                        None => (false, Vec::new()),
+                        None => (false, None),
                     }
                 };
                 watching = true;
-                send_snapshot(&tx, &instance_id, online, addresses);
+                send_snapshot(&tx, &instance_id, online, payload);
             }
             Ok(AppIn::Unwatch) => {
                 if watching {
@@ -123,12 +123,7 @@ async fn handle(socket: WebSocket, state: AppState, instance_id: String, ip: Str
                 }
             }
             Err(_) => {
-                send_json(
-                    &tx,
-                    &AppOut::Error {
-                        message: "bad message".into(),
-                    },
-                );
+                send_json(&tx, &AppOut::Error { message: "bad message".into() });
             }
         }
     }
@@ -147,13 +142,13 @@ async fn handle(socket: WebSocket, state: AppState, instance_id: String, ip: Str
     ip_release(&state, &ip).await;
 }
 
-fn send_snapshot(tx: &Tx, instance_id: &str, online: bool, addresses: Vec<crate::model::Address>) {
+fn send_snapshot(tx: &Tx, instance_id: &str, online: bool, payload: Option<String>) {
     send_json(
         tx,
         &AppOut::Snapshot {
             instance_id: instance_id.to_string(),
             online,
-            addresses,
+            payload,
         },
     );
 }

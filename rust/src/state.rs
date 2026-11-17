@@ -1,8 +1,8 @@
 //! 全内存的共享状态：设备记录、每台设备的令牌、订阅者，以及防滥用所需的计数与限速。
 //!
-//! 进程重启后这些全部清空——设备是长连接，会自动重连并重新上报；令牌在重连时重新发一份
-//! 给插件、插件再转交 APP，插件自己也会持久化一份用于重连校验。真要做多实例 / 重启不丢时，
-//! 把这一层换成 Redis 即可（见 README）。
+//! 设备记录里存的是一段**不透明密文载荷**（`payload`）——总控不解析、不持钥。进程重启后
+//! 全部清空；设备是长连接，会自动重连并重新上报。真要做多实例 / 重启不丢，把这一层换成
+//! Redis 即可（见 README）。
 
 use std::{
     collections::HashMap,
@@ -13,7 +13,7 @@ use std::{
 use axum::{extract::ws::Message, http::HeaderMap};
 use tokio::sync::{mpsc, RwLock};
 
-use crate::model::{canonical, Address, AppOut};
+use crate::model::AppOut;
 
 /// 一条连接的出站通道。写线程独占 socket 的写端，其它地方往这里丢消息。
 pub type Tx = mpsc::UnboundedSender<Message>;
@@ -84,7 +84,8 @@ impl RateBucket {
 /// 设备重连时新旧两条连接可能短暂并存，旧连接退出时不能把新记录删掉。
 pub struct DeviceEntry {
     pub conn_id: u64,
-    pub addresses: Vec<Address>,
+    /// 不透明密文载荷（信封 JSON）。总控不解析。
+    pub payload: String,
     /// 最近一次被 APP 查询 / 订阅的时间（秒）。满载淘汰就按它挑「最久没人查」的。
     pub last_app_interest: u64,
     /// 这条设备连接的出站通道。
@@ -102,8 +103,6 @@ pub struct TokenEntry {
 pub enum RegisterOutcome {
     Ok {
         token: String,
-        /// 地址相对上一次有没有变化（决定要不要通知订阅者）。
-        changed: bool,
         /// 为腾位置被淘汰掉的旧连接（调用方负责关掉它们）。
         evicted: Vec<Tx>,
     },
@@ -119,7 +118,7 @@ pub struct Inner {
     /// 在线设备：instanceId → 记录。
     pub devices: HashMap<String, DeviceEntry>,
     /// 每台设备的令牌。**故意不随设备断开而删除**：设备重连要拿回同一个令牌，APP 手里的
-    /// 才不会失效。超上限时按最久未注册淘汰（避免「不停换 instanceId」把内存吃满）。
+    /// 才不会失效。超上限时按最久未注册淘汰。
     pub tokens: HashMap<String, TokenEntry>,
     /// 订阅者：instanceId → (订阅 id → 出站通道)。
     pub watchers: HashMap<String, HashMap<u64, Tx>>,
@@ -166,7 +165,7 @@ impl Inner {
         &mut self,
         instance_id: &str,
         conn_id: u64,
-        addresses: Vec<Address>,
+        payload: String,
         control: Tx,
         provided_token: Option<&str>,
         now: u64,
@@ -179,7 +178,7 @@ impl Inner {
             return RegisterOutcome::RateLimited;
         }
 
-        // 授权：这台设备若已登记过令牌，重连/覆盖时必须带上同一枚；否则当成冒充直接拒绝。
+        // 授权：已登记过令牌的设备，重连/覆盖时必须带同一枚；否则当成冒充拒绝。
         // 首次注册（process 重启后 map 为空、或新设备）则发一枚新令牌。
         let token = match self.tokens.get(instance_id) {
             Some(entry) => match provided_token {
@@ -212,16 +211,11 @@ impl Inner {
             }
         }
 
-        let changed = self
-            .devices
-            .get(instance_id)
-            .map(|d| canonical(&d.addresses) != canonical(&addresses))
-            .unwrap_or(true);
         self.devices.insert(
             instance_id.to_string(),
             DeviceEntry {
                 conn_id,
-                addresses,
+                payload,
                 last_app_interest: now,
                 control,
             },
@@ -234,11 +228,7 @@ impl Inner {
             },
         );
         self.trim_tokens(limits.max_tokens);
-        RegisterOutcome::Ok {
-            token,
-            changed,
-            evicted,
-        }
+        RegisterOutcome::Ok { token, evicted }
     }
 }
 
@@ -309,24 +299,24 @@ pub async fn ip_release(state: &AppState, ip: &str) {
     }
 }
 
-/// 把这台设备当前的地址快照读出来，顺便刷新「被 APP 关注」的时间。
-pub async fn snapshot(state: &AppState, instance_id: &str) -> (bool, Vec<Address>) {
+/// 把这台设备当前的密文载荷读出来，顺便刷新「被 APP 关注」的时间。
+pub async fn snapshot(state: &AppState, instance_id: &str) -> (bool, Option<String>) {
     let mut g = state.inner.write().await;
     let now = now_secs();
     match g.devices.get_mut(instance_id) {
         Some(entry) => {
             entry.last_app_interest = now;
-            (true, entry.addresses.clone())
+            (true, Some(entry.payload.clone()))
         }
-        None => (false, Vec::new()),
+        None => (false, None),
     }
 }
 
-/// 地址有变化时，只通知正在订阅这台设备的 APP。没订阅者就什么都不做（链路自然静默）。
-pub async fn broadcast_update(state: &AppState, instance_id: &str, addresses: &[Address]) {
-    let payload = match serde_json::to_string(&AppOut::Update {
+/// 载荷有变化时，只通知正在订阅这台设备的 APP。没订阅者就什么都不做（链路自然静默）。
+pub async fn broadcast_update(state: &AppState, instance_id: &str, payload: &str) {
+    let message = match serde_json::to_string(&AppOut::Update {
         instance_id: instance_id.to_string(),
-        addresses: addresses.to_vec(),
+        payload: payload.to_string(),
     }) {
         Ok(p) => p,
         Err(_) => return,
@@ -339,13 +329,13 @@ pub async fn broadcast_update(state: &AppState, instance_id: &str, addresses: &[
             .unwrap_or_default()
     };
     for tx in txs {
-        let _ = tx.send(Message::Text(payload.clone().into()));
+        let _ = tx.send(Message::Text(message.clone().into()));
     }
 }
 
 /// 设备断开时通知订阅者。
 pub async fn broadcast_offline(state: &AppState, instance_id: &str) {
-    let payload = match serde_json::to_string(&AppOut::Offline {
+    let message = match serde_json::to_string(&AppOut::Offline {
         instance_id: instance_id.to_string(),
     }) {
         Ok(p) => p,
@@ -359,7 +349,7 @@ pub async fn broadcast_offline(state: &AppState, instance_id: &str) {
             .unwrap_or_default()
     };
     for tx in txs {
-        let _ = tx.send(Message::Text(payload.clone().into()));
+        let _ = tx.send(Message::Text(message.clone().into()));
     }
 }
 
@@ -377,16 +367,8 @@ mod tests {
         }
     }
 
-    fn addr(url: &str) -> Address {
-        Address {
-            kind: Some("relay".into()),
-            url: url.into(),
-        }
-    }
-
     fn tx() -> Tx {
         let (tx, rx) = mpsc::unbounded_channel::<Message>();
-        // 故意泄漏接收端，测试里不关心出站消息是否被消费。
         std::mem::forget(rx);
         tx
     }
@@ -395,10 +377,14 @@ mod tests {
     fn rate_limit_rejects_after_burst() {
         let l = limits(100, 0.0, 1.0, 1000);
         let mut inner = Inner::new(1.0);
-        let r1 = inner.register("a", 1, vec![addr("https://a")], tx(), None, 1000, &l);
-        assert!(matches!(r1, RegisterOutcome::Ok { .. }));
-        let r2 = inner.register("b", 2, vec![addr("https://b")], tx(), None, 1000, &l);
-        assert!(matches!(r2, RegisterOutcome::RateLimited));
+        assert!(matches!(
+            inner.register("a", 1, "pa".into(), tx(), None, 1000, &l),
+            RegisterOutcome::Ok { .. }
+        ));
+        assert!(matches!(
+            inner.register("b", 2, "pb".into(), tx(), None, 1000, &l),
+            RegisterOutcome::RateLimited
+        ));
     }
 
     #[test]
@@ -406,11 +392,10 @@ mod tests {
         let l = limits(1, 1000.0, 1000.0, 1000);
         let mut inner = Inner::new(1000.0);
         assert!(matches!(
-            inner.register("a", 1, vec![addr("https://a")], tx(), None, 100, &l),
+            inner.register("a", 1, "pa".into(), tx(), None, 100, &l),
             RegisterOutcome::Ok { .. }
         ));
-        let r = inner.register("b", 2, vec![addr("https://b")], tx(), None, 200, &l);
-        match r {
+        match inner.register("b", 2, "pb".into(), tx(), None, 200, &l) {
             RegisterOutcome::Ok { evicted, .. } => assert_eq!(evicted.len(), 1),
             _ => panic!("expected ok"),
         }
@@ -423,33 +408,33 @@ mod tests {
         let l = limits(1, 1000.0, 1000.0, 1000);
         let mut inner = Inner::new(1000.0);
         assert!(matches!(
-            inner.register("a", 1, vec![addr("https://a")], tx(), None, 100, &l),
+            inner.register("a", 1, "pa".into(), tx(), None, 100, &l),
             RegisterOutcome::Ok { .. }
         ));
         inner.watchers.entry("a".into()).or_default().insert(1, tx());
-        let r = inner.register("b", 2, vec![addr("https://b")], tx(), None, 200, &l);
-        assert!(matches!(r, RegisterOutcome::Full));
+        assert!(matches!(
+            inner.register("b", 2, "pb".into(), tx(), None, 200, &l),
+            RegisterOutcome::Full
+        ));
     }
 
     #[test]
     fn re_register_requires_matching_token() {
         let l = limits(100, 1000.0, 1000.0, 1000);
         let mut inner = Inner::new(1000.0);
-        let first = match inner.register("a", 1, vec![addr("https://a")], tx(), None, 100, &l) {
+        let first = match inner.register("a", 1, "pa".into(), tx(), None, 100, &l) {
             RegisterOutcome::Ok { token, .. } => token,
             _ => panic!("expected ok"),
         };
-        // 不带令牌 / 带错令牌都拒绝。
         assert!(matches!(
-            inner.register("a", 2, vec![addr("https://a")], tx(), None, 200, &l),
+            inner.register("a", 2, "pa".into(), tx(), None, 200, &l),
             RegisterOutcome::Unauthorized
         ));
         assert!(matches!(
-            inner.register("a", 2, vec![addr("https://a")], tx(), Some("wrong"), 200, &l),
+            inner.register("a", 2, "pa".into(), tx(), Some("wrong"), 200, &l),
             RegisterOutcome::Unauthorized
         ));
-        // 带对令牌：放行，且令牌不变。
-        match inner.register("a", 2, vec![addr("https://a")], tx(), Some(&first), 200, &l) {
+        match inner.register("a", 2, "pa".into(), tx(), Some(&first), 200, &l) {
             RegisterOutcome::Ok { token, .. } => assert_eq!(token, first),
             _ => panic!("expected ok"),
         }
@@ -460,14 +445,12 @@ mod tests {
         let l = limits(100, 1000.0, 1000.0, 2);
         let mut inner = Inner::new(1000.0);
         for (i, id) in ["a", "b", "c"].iter().enumerate() {
-            let now = 100 + i as u64;
             assert!(matches!(
-                inner.register(id, i as u64 + 1, vec![addr("https://x")], tx(), None, now, &l),
+                inner.register(id, i as u64 + 1, "p".into(), tx(), None, 100 + i as u64, &l),
                 RegisterOutcome::Ok { .. }
             ));
         }
         assert!(inner.tokens.len() <= 2, "tokens={}", inner.tokens.len());
-        // 最久没注册的 a 被淘汰，最近两个还在。
         assert!(!inner.tokens.contains_key("a"));
         assert!(inner.tokens.contains_key("c"));
     }

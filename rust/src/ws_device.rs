@@ -1,7 +1,8 @@
 //! 设备侧长连接（`/ws/device`）。
 //!
-//! 设备（插件宿主）主动连上来，报 `instanceId` 与一组连接地址；连接一断，这台就算离线，
-//! 订阅它的 APP 会收到一条离线事件。地址没变化时这里不发任何主动消息，链路保持静默。
+//! 设备（插件宿主）主动连上来，报 `instanceId` 与一份**加密载荷**（全部连接地址封在里面，
+//! 总控不解析）；连接一断，这台就算离线，订阅它的 APP 会收到一条离线事件。载荷没变化时
+//! 这里不发任何主动消息，链路保持静默。
 
 use axum::{
     extract::{
@@ -14,7 +15,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 
-use crate::model::{canonical, normalize_addresses, DeviceIn, DeviceOut};
+use crate::model::{DeviceIn, DeviceOut, MAX_PAYLOAD_BYTES};
 use crate::state::{
     broadcast_offline, broadcast_update, client_ip, ip_acquire, ip_has_room, ip_release, now_secs,
     AppState, RegisterOutcome, Tx,
@@ -84,8 +85,11 @@ async fn handle(
             _ => continue,
         };
         match serde_json::from_str::<DeviceIn>(&text) {
-            Ok(DeviceIn::Register { addresses }) => {
-                let addresses = normalize_addresses(addresses);
+            Ok(DeviceIn::Register { payload }) => {
+                if payload.len() > MAX_PAYLOAD_BYTES {
+                    send_json(&tx, &DeviceOut::Error { message: "payload too large".into() });
+                    break;
+                }
                 let now = now_secs();
                 let limits = state.limits.clone();
                 let outcome = {
@@ -93,7 +97,7 @@ async fn handle(
                     g.register(
                         &instance_id,
                         conn_id,
-                        addresses.clone(),
+                        payload.clone(),
                         tx.clone(),
                         provided_token.as_deref(),
                         now,
@@ -101,11 +105,7 @@ async fn handle(
                     )
                 };
                 match outcome {
-                    RegisterOutcome::Ok {
-                        token,
-                        changed,
-                        evicted,
-                    } => {
+                    RegisterOutcome::Ok { token, evicted } => {
                         for control in evicted {
                             let _ = control.send(Message::Close(None));
                         }
@@ -116,78 +116,52 @@ async fn handle(
                                 token,
                             },
                         );
-                        if changed {
-                            broadcast_update(&state, &instance_id, &addresses).await;
-                        }
+                        broadcast_update(&state, &instance_id, &payload).await;
                         registered = true;
                     }
                     RegisterOutcome::RateLimited => {
-                        send_json(
-                            &tx,
-                            &DeviceOut::Error {
-                                message: "rate limited, retry later".into(),
-                            },
-                        );
+                        send_json(&tx, &DeviceOut::Error { message: "rate limited, retry later".into() });
                         break;
                     }
                     RegisterOutcome::Full => {
-                        send_json(
-                            &tx,
-                            &DeviceOut::Error {
-                                message: "server busy, retry later".into(),
-                            },
-                        );
+                        send_json(&tx, &DeviceOut::Error { message: "server busy, retry later".into() });
                         break;
                     }
                     RegisterOutcome::Unauthorized => {
-                        send_json(
-                            &tx,
-                            &DeviceOut::Error {
-                                message: "unauthorized".into(),
-                            },
-                        );
+                        send_json(&tx, &DeviceOut::Error { message: "unauthorized".into() });
                         break;
                     }
                 }
             }
-            Ok(DeviceIn::Update { addresses }) => {
+            Ok(DeviceIn::Update { payload }) => {
                 if !registered {
-                    send_json(
-                        &tx,
-                        &DeviceOut::Error {
-                            message: "send register first".into(),
-                        },
-                    );
+                    send_json(&tx, &DeviceOut::Error { message: "send register first".into() });
                     continue;
                 }
-                let addresses = normalize_addresses(addresses);
-                let changed = {
+                if payload.len() > MAX_PAYLOAD_BYTES {
+                    send_json(&tx, &DeviceOut::Error { message: "payload too large".into() });
+                    continue;
+                }
+                let owned = {
                     let mut g = state.inner.write().await;
-                    match g.devices.get(&instance_id) {
-                        Some(d) if d.conn_id == conn_id => {
-                            let changed = canonical(&d.addresses) != canonical(&addresses);
-                            if changed {
-                                if let Some(entry) = g.devices.get_mut(&instance_id) {
-                                    entry.addresses = addresses.clone();
-                                }
-                            }
-                            changed
+                    match g.devices.get_mut(&instance_id) {
+                        Some(entry) if entry.conn_id == conn_id => {
+                            entry.payload = payload.clone();
+                            true
                         }
                         _ => false,
                     }
                 };
-                send_json(&tx, &DeviceOut::Updated);
-                if changed {
-                    broadcast_update(&state, &instance_id, &addresses).await;
+                if owned {
+                    send_json(&tx, &DeviceOut::Updated);
+                    broadcast_update(&state, &instance_id, &payload).await;
+                } else {
+                    // 记录已被淘汰 / 换了一条连接：让设备重新注册。
+                    send_json(&tx, &DeviceOut::Error { message: "send register first".into() });
                 }
             }
             Err(_) => {
-                send_json(
-                    &tx,
-                    &DeviceOut::Error {
-                        message: "bad message".into(),
-                    },
-                );
+                send_json(&tx, &DeviceOut::Error { message: "bad message".into() });
             }
         }
     }
