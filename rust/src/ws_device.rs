@@ -24,6 +24,9 @@ use crate::state::{
 #[serde(rename_all = "camelCase")]
 pub struct DeviceQuery {
     instance_id: String,
+    /// 这台设备上次注册时拿到的令牌。首次注册为空；之后重连/覆盖必须带上同一枚（防冒充）。
+    #[serde(default)]
+    token: Option<String>,
 }
 
 pub async fn handler(
@@ -36,11 +39,17 @@ pub async fn handler(
     if !ip_has_room(&state, &ip).await {
         return (StatusCode::TOO_MANY_REQUESTS, "too many connections").into_response();
     }
-    let instance_id = query.instance_id;
-    ws.on_upgrade(move |socket| handle(socket, state, instance_id, ip))
+    let DeviceQuery { instance_id, token } = query;
+    ws.on_upgrade(move |socket| handle(socket, state, instance_id, ip, token))
 }
 
-async fn handle(socket: WebSocket, state: AppState, instance_id: String, ip: String) {
+async fn handle(
+    socket: WebSocket,
+    state: AppState,
+    instance_id: String,
+    ip: String,
+    provided_token: Option<String>,
+) {
     ip_acquire(&state, &ip).await;
 
     let (mut sink, mut stream) = socket.split();
@@ -81,7 +90,15 @@ async fn handle(socket: WebSocket, state: AppState, instance_id: String, ip: Str
                 let limits = state.limits.clone();
                 let outcome = {
                     let mut g = state.inner.write().await;
-                    g.register(&instance_id, conn_id, addresses.clone(), tx.clone(), now, &limits)
+                    g.register(
+                        &instance_id,
+                        conn_id,
+                        addresses.clone(),
+                        tx.clone(),
+                        provided_token.as_deref(),
+                        now,
+                        &limits,
+                    )
                 };
                 match outcome {
                     RegisterOutcome::Ok {
@@ -118,6 +135,15 @@ async fn handle(socket: WebSocket, state: AppState, instance_id: String, ip: Str
                             &tx,
                             &DeviceOut::Error {
                                 message: "server busy, retry later".into(),
+                            },
+                        );
+                        break;
+                    }
+                    RegisterOutcome::Unauthorized => {
+                        send_json(
+                            &tx,
+                            &DeviceOut::Error {
+                                message: "unauthorized".into(),
                             },
                         );
                         break;

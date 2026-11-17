@@ -40,7 +40,7 @@ pub async fn handler(
         let g = state.inner.read().await;
         g.tokens
             .get(&query.instance_id)
-            .map(|t| t == &query.token)
+            .map(|entry| entry.token == query.token)
             .unwrap_or(false)
     };
     if !authorized {

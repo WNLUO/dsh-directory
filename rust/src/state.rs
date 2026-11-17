@@ -1,7 +1,8 @@
 //! 全内存的共享状态：设备记录、每台设备的令牌、订阅者，以及防滥用所需的计数与限速。
 //!
-//! 进程重启后这些全部清空——设备是长连接，会自动重连并重新上报，令牌在重连时重新发一份
-//! 给插件、插件再转交 APP。真要做多实例 / 重启不丢时，把这一层换成 Redis 即可（见 README）。
+//! 进程重启后这些全部清空——设备是长连接，会自动重连并重新上报；令牌在重连时重新发一份
+//! 给插件、插件再转交 APP，插件自己也会持久化一份用于重连校验。真要做多实例 / 重启不丢时，
+//! 把这一层换成 Redis 即可（见 README）。
 
 use std::{
     collections::HashMap,
@@ -20,10 +21,10 @@ pub type Tx = mpsc::UnboundedSender<Message>;
 /// 防滥用 / 容量的可调参数，全部有默认值，可用环境变量覆盖。
 #[derive(Clone)]
 pub struct Limits {
-    /// 一条注册信息在「没有任何 APP 关注」后还能留多久（秒）。
-    pub ttl_secs: u64,
     /// 设备记录总量上限。到线后靠淘汰「最久没被 APP 查」的那条腾位。
     pub max_devices: usize,
+    /// 每台设备的令牌记录上限。到线后淘汰最久没来注册的（挡住「不停换 instanceId」把内存吃满）。
+    pub max_tokens: usize,
     /// 单个来源 IP 的并发连接上限（含设备与 APP）。
     pub max_conns_per_ip: u32,
     /// 全局新注册速率（每秒令牌数）与突发上限，用于挡住 CC 洪峰。
@@ -33,9 +34,6 @@ pub struct Limits {
 
 impl Limits {
     pub fn from_env() -> Self {
-        fn u64v(k: &str, d: u64) -> u64 {
-            std::env::var(k).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(d)
-        }
         fn usizev(k: &str, d: usize) -> usize {
             std::env::var(k).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(d)
         }
@@ -46,8 +44,8 @@ impl Limits {
             std::env::var(k).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(d)
         }
         Self {
-            ttl_secs: u64v("REGISTRATION_TTL_SECS", 900),
             max_devices: usizev("MAX_DEVICES", 100_000),
+            max_tokens: usizev("MAX_TOKENS", 200_000),
             max_conns_per_ip: u32v("MAX_CONNS_PER_IP", 50),
             reg_per_sec: f64v("REG_RATE_PER_SEC", 500.0),
             reg_burst: f64v("REG_RATE_BURST", 1000.0),
@@ -87,10 +85,17 @@ impl RateBucket {
 pub struct DeviceEntry {
     pub conn_id: u64,
     pub addresses: Vec<Address>,
-    /// 最近一次被 APP 查询 / 订阅的时间（秒）。过期淘汰就按它算。
+    /// 最近一次被 APP 查询 / 订阅的时间（秒）。满载淘汰就按它挑「最久没人查」的。
     pub last_app_interest: u64,
-    /// 这条设备连接的出站通道，淘汰时用它把连接关掉、让插件重连补报。
+    /// 这条设备连接的出站通道。
     pub control: Tx,
+}
+
+/// 一台设备的令牌与「最近一次来注册」的时间。令牌不随设备断开删除（重连要拿回同一个），
+/// 只在超过总量上限时按最久未注册淘汰。
+pub struct TokenEntry {
+    pub token: String,
+    pub last_seen: u64,
 }
 
 /// 一次注册的处理结果。
@@ -106,14 +111,16 @@ pub enum RegisterOutcome {
     RateLimited,
     /// 记录已满且没有可淘汰的对象（每条都在被订阅）。
     Full,
+    /// 这台设备已经登记过令牌，但这次没带上同一枚 —— 视为冒充，拒绝。
+    Unauthorized,
 }
 
 pub struct Inner {
     /// 在线设备：instanceId → 记录。
     pub devices: HashMap<String, DeviceEntry>,
     /// 每台设备的令牌。**故意不随设备断开而删除**：设备重连要拿回同一个令牌，APP 手里的
-    /// 才不会失效。进程重启清空，设备重连会换新令牌并重新同步给 APP。
-    pub tokens: HashMap<String, String>,
+    /// 才不会失效。超上限时按最久未注册淘汰（避免「不停换 instanceId」把内存吃满）。
+    pub tokens: HashMap<String, TokenEntry>,
     /// 订阅者：instanceId → (订阅 id → 出站通道)。
     pub watchers: HashMap<String, HashMap<u64, Tx>>,
     /// 每个来源 IP 当前的连接数。
@@ -136,13 +143,32 @@ impl Inner {
         }
     }
 
-    /// 收下一次设备注册：限速 → 满则淘汰「最久没人查」的 → 写记录、发令牌。
+    /// 超过令牌上限时，淘汰最久没来注册的那些，直到降回上限以内。
+    fn trim_tokens(&mut self, max: usize) {
+        let max = max.max(1);
+        if self.tokens.len() <= max {
+            return;
+        }
+        let mut entries: Vec<(String, u64)> = self
+            .tokens
+            .iter()
+            .map(|(id, entry)| (id.clone(), entry.last_seen))
+            .collect();
+        entries.sort_by_key(|(_, last)| *last);
+        let remove = self.tokens.len() - max;
+        for (id, _) in entries.into_iter().take(remove) {
+            self.tokens.remove(&id);
+        }
+    }
+
+    /// 收下一次设备注册：限速 → 校验令牌（防冒充）→ 满则淘汰「最久没人查」的 → 写记录、发令牌。
     pub fn register(
         &mut self,
         instance_id: &str,
         conn_id: u64,
         addresses: Vec<Address>,
         control: Tx,
+        provided_token: Option<&str>,
         now: u64,
         limits: &Limits,
     ) -> RegisterOutcome {
@@ -152,6 +178,16 @@ impl Inner {
         {
             return RegisterOutcome::RateLimited;
         }
+
+        // 授权：这台设备若已登记过令牌，重连/覆盖时必须带上同一枚；否则当成冒充直接拒绝。
+        // 首次注册（process 重启后 map 为空、或新设备）则发一枚新令牌。
+        let token = match self.tokens.get(instance_id) {
+            Some(entry) => match provided_token {
+                Some(p) if p == entry.token => entry.token.clone(),
+                _ => return RegisterOutcome::Unauthorized,
+            },
+            None => uuid::Uuid::new_v4().to_string(),
+        };
 
         let exists = self.devices.contains_key(instance_id);
         let mut evicted = Vec::new();
@@ -176,14 +212,6 @@ impl Inner {
             }
         }
 
-        let token = match self.tokens.get(instance_id) {
-            Some(t) => t.clone(),
-            None => {
-                let t = uuid::Uuid::new_v4().to_string();
-                self.tokens.insert(instance_id.to_string(), t.clone());
-                t
-            }
-        };
         let changed = self
             .devices
             .get(instance_id)
@@ -194,11 +222,18 @@ impl Inner {
             DeviceEntry {
                 conn_id,
                 addresses,
-                // 新注册给一整段宽限：从此刻起算，避免「刚注册就被下一轮清理扫掉」。
                 last_app_interest: now,
                 control,
             },
         );
+        self.tokens.insert(
+            instance_id.to_string(),
+            TokenEntry {
+                token: token.clone(),
+                last_seen: now,
+            },
+        );
+        self.trim_tokens(limits.max_tokens);
         RegisterOutcome::Ok {
             token,
             changed,
@@ -328,48 +363,14 @@ pub async fn broadcast_offline(state: &AppState, instance_id: &str) {
     }
 }
 
-/// 定期清理：丢掉「超过 TTL 没有任何 APP 关注、且没有被订阅」的设备记录，并关掉它的连接，
-/// 让插件走退避重连补报。返回这一轮清掉的数量（给日志用）。
-pub async fn sweep(state: &AppState) -> usize {
-    let now = now_secs();
-    let ttl = state.limits.ttl_secs;
-    let emptied: Vec<(String, Tx)> = {
-        let mut g = state.inner.write().await;
-        let expired: Vec<String> = {
-            let devices = &g.devices;
-            let watchers = &g.watchers;
-            devices
-                .iter()
-                .filter(|(id, e)| {
-                    let watched = watchers.get(*id).map(|m| !m.is_empty()).unwrap_or(false);
-                    !watched && now.saturating_sub(e.last_app_interest) > ttl
-                })
-                .map(|(id, _)| id.clone())
-                .collect()
-        };
-        let mut out = Vec::new();
-        for id in expired {
-            if let Some(entry) = g.devices.remove(&id) {
-                out.push((id, entry.control));
-            }
-        }
-        out
-    };
-    let count = emptied.len();
-    for (_id, control) in emptied {
-        let _ = control.send(Message::Close(None));
-    }
-    count
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn limits(max_devices: usize, reg_per_sec: f64, reg_burst: f64, ttl: u64) -> Limits {
+    fn limits(max_devices: usize, reg_per_sec: f64, reg_burst: f64, max_tokens: usize) -> Limits {
         Limits {
-            ttl_secs: ttl,
             max_devices,
+            max_tokens,
             max_conns_per_ip: 50,
             reg_per_sec,
             reg_burst,
@@ -384,33 +385,31 @@ mod tests {
     }
 
     fn tx() -> Tx {
-        let (tx, _rx) = mpsc::unbounded_channel::<Message>();
+        let (tx, rx) = mpsc::unbounded_channel::<Message>();
         // 故意泄漏接收端，测试里不关心出站消息是否被消费。
-        std::mem::forget(_rx);
+        std::mem::forget(rx);
         tx
     }
 
     #[test]
     fn rate_limit_rejects_after_burst() {
-        let l = limits(100, 0.0, 1.0, 60);
+        let l = limits(100, 0.0, 1.0, 1000);
         let mut inner = Inner::new(1.0);
-        let now = 1000;
-        let r1 = inner.register("a", 1, vec![addr("wss://a")], tx(), now, &l);
+        let r1 = inner.register("a", 1, vec![addr("https://a")], tx(), None, 1000, &l);
         assert!(matches!(r1, RegisterOutcome::Ok { .. }));
-        let r2 = inner.register("b", 2, vec![addr("wss://b")], tx(), now, &l);
+        let r2 = inner.register("b", 2, vec![addr("https://b")], tx(), None, 1000, &l);
         assert!(matches!(r2, RegisterOutcome::RateLimited));
     }
 
     #[test]
     fn over_capacity_evicts_least_recently_interested() {
-        let l = limits(1, 1000.0, 1000.0, 60);
+        let l = limits(1, 1000.0, 1000.0, 1000);
         let mut inner = Inner::new(1000.0);
-        // A 更早注册（interest=100），B 的注册会把它挤掉。
         assert!(matches!(
-            inner.register("a", 1, vec![addr("wss://a")], tx(), 100, &l),
+            inner.register("a", 1, vec![addr("https://a")], tx(), None, 100, &l),
             RegisterOutcome::Ok { .. }
         ));
-        let r = inner.register("b", 2, vec![addr("wss://b")], tx(), 200, &l);
+        let r = inner.register("b", 2, vec![addr("https://b")], tx(), None, 200, &l);
         match r {
             RegisterOutcome::Ok { evicted, .. } => assert_eq!(evicted.len(), 1),
             _ => panic!("expected ok"),
@@ -421,37 +420,55 @@ mod tests {
 
     #[test]
     fn full_when_everything_is_watched() {
-        let l = limits(1, 1000.0, 1000.0, 60);
+        let l = limits(1, 1000.0, 1000.0, 1000);
         let mut inner = Inner::new(1000.0);
         assert!(matches!(
-            inner.register("a", 1, vec![addr("wss://a")], tx(), 100, &l),
+            inner.register("a", 1, vec![addr("https://a")], tx(), None, 100, &l),
             RegisterOutcome::Ok { .. }
         ));
-        // 给 A 挂一个订阅者，让它不可被淘汰。
         inner.watchers.entry("a".into()).or_default().insert(1, tx());
-        let r = inner.register("b", 2, vec![addr("wss://b")], tx(), 200, &l);
+        let r = inner.register("b", 2, vec![addr("https://b")], tx(), None, 200, &l);
         assert!(matches!(r, RegisterOutcome::Full));
     }
 
-    #[tokio::test]
-    async fn sweep_drops_idle_but_keeps_watched() {
-        let l = limits(100, 1000.0, 1000.0, 5);
-        let state = AppState::new(l);
-        {
-            let mut g = state.inner.write().await;
-            g.register("idle", 1, vec![addr("wss://idle")], tx(), now_secs(), &state.limits);
-            g.register("used", 2, vec![addr("wss://used")], tx(), now_secs(), &state.limits);
-            // 两条都划到「很久以前」，超过 5 秒 TTL。
-            let old = now_secs() - 100;
-            g.devices.get_mut("idle").unwrap().last_app_interest = old;
-            g.devices.get_mut("used").unwrap().last_app_interest = old;
-            // used 有人订阅，不该被清。
-            g.watchers.entry("used".into()).or_default().insert(1, tx());
+    #[test]
+    fn re_register_requires_matching_token() {
+        let l = limits(100, 1000.0, 1000.0, 1000);
+        let mut inner = Inner::new(1000.0);
+        let first = match inner.register("a", 1, vec![addr("https://a")], tx(), None, 100, &l) {
+            RegisterOutcome::Ok { token, .. } => token,
+            _ => panic!("expected ok"),
+        };
+        // 不带令牌 / 带错令牌都拒绝。
+        assert!(matches!(
+            inner.register("a", 2, vec![addr("https://a")], tx(), None, 200, &l),
+            RegisterOutcome::Unauthorized
+        ));
+        assert!(matches!(
+            inner.register("a", 2, vec![addr("https://a")], tx(), Some("wrong"), 200, &l),
+            RegisterOutcome::Unauthorized
+        ));
+        // 带对令牌：放行，且令牌不变。
+        match inner.register("a", 2, vec![addr("https://a")], tx(), Some(&first), 200, &l) {
+            RegisterOutcome::Ok { token, .. } => assert_eq!(token, first),
+            _ => panic!("expected ok"),
         }
-        let removed = sweep(&state).await;
-        assert_eq!(removed, 1);
-        let g = state.inner.read().await;
-        assert!(!g.devices.contains_key("idle"));
-        assert!(g.devices.contains_key("used"));
+    }
+
+    #[test]
+    fn token_map_is_capped() {
+        let l = limits(100, 1000.0, 1000.0, 2);
+        let mut inner = Inner::new(1000.0);
+        for (i, id) in ["a", "b", "c"].iter().enumerate() {
+            let now = 100 + i as u64;
+            assert!(matches!(
+                inner.register(id, i as u64 + 1, vec![addr("https://x")], tx(), None, now, &l),
+                RegisterOutcome::Ok { .. }
+            ));
+        }
+        assert!(inner.tokens.len() <= 2, "tokens={}", inner.tokens.len());
+        // 最久没注册的 a 被淘汰，最近两个还在。
+        assert!(!inner.tokens.contains_key("a"));
+        assert!(inner.tokens.contains_key("c"));
     }
 }
