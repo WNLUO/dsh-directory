@@ -8,13 +8,17 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Query, State,
     },
-    response::Response,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 
 use crate::model::{canonical, normalize_addresses, DeviceIn, DeviceOut};
-use crate::state::{broadcast_offline, broadcast_update, AppState, DeviceEntry, Tx};
+use crate::state::{
+    broadcast_offline, broadcast_update, client_ip, ip_acquire, ip_has_room, ip_release, now_secs,
+    AppState, RegisterOutcome, Tx,
+};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -24,14 +28,21 @@ pub struct DeviceQuery {
 
 pub async fn handler(
     ws: WebSocketUpgrade,
+    headers: HeaderMap,
     State(state): State<AppState>,
     Query(query): Query<DeviceQuery>,
 ) -> Response {
+    let ip = client_ip(&headers);
+    if !ip_has_room(&state, &ip).await {
+        return (StatusCode::TOO_MANY_REQUESTS, "too many connections").into_response();
+    }
     let instance_id = query.instance_id;
-    ws.on_upgrade(move |socket| handle(socket, state, instance_id))
+    ws.on_upgrade(move |socket| handle(socket, state, instance_id, ip))
 }
 
-async fn handle(socket: WebSocket, state: AppState, instance_id: String) {
+async fn handle(socket: WebSocket, state: AppState, instance_id: String, ip: String) {
+    ip_acquire(&state, &ip).await;
+
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
     let writer = tokio::spawn(async move {
@@ -66,45 +77,61 @@ async fn handle(socket: WebSocket, state: AppState, instance_id: String) {
         match serde_json::from_str::<DeviceIn>(&text) {
             Ok(DeviceIn::Register { addresses }) => {
                 let addresses = normalize_addresses(addresses);
-                let (token, changed) = {
+                let now = now_secs();
+                let limits = state.limits.clone();
+                let outcome = {
                     let mut g = state.inner.write().await;
-                    let token = match g.tokens.get(&instance_id) {
-                        Some(t) => t.clone(),
-                        None => {
-                            let t = uuid::Uuid::new_v4().to_string();
-                            g.tokens.insert(instance_id.clone(), t.clone());
-                            t
-                        }
-                    };
-                    let changed = g
-                        .devices
-                        .get(&instance_id)
-                        .map(|d| canonical(&d.addresses) != canonical(&addresses))
-                        .unwrap_or(true);
-                    g.devices.insert(
-                        instance_id.clone(),
-                        DeviceEntry {
-                            conn_id,
-                            addresses: addresses.clone(),
-                            updated_at: crate::state::now_secs(),
-                        },
-                    );
-                    (token, changed)
+                    g.register(&instance_id, conn_id, addresses.clone(), tx.clone(), now, &limits)
                 };
-                send_json(&tx, &DeviceOut::Registered {
-                    instance_id: instance_id.clone(),
-                    token,
-                });
-                if changed {
-                    broadcast_update(&state, &instance_id, &addresses).await;
+                match outcome {
+                    RegisterOutcome::Ok {
+                        token,
+                        changed,
+                        evicted,
+                    } => {
+                        for control in evicted {
+                            let _ = control.send(Message::Close(None));
+                        }
+                        send_json(
+                            &tx,
+                            &DeviceOut::Registered {
+                                instance_id: instance_id.clone(),
+                                token,
+                            },
+                        );
+                        if changed {
+                            broadcast_update(&state, &instance_id, &addresses).await;
+                        }
+                        registered = true;
+                    }
+                    RegisterOutcome::RateLimited => {
+                        send_json(
+                            &tx,
+                            &DeviceOut::Error {
+                                message: "rate limited, retry later".into(),
+                            },
+                        );
+                        break;
+                    }
+                    RegisterOutcome::Full => {
+                        send_json(
+                            &tx,
+                            &DeviceOut::Error {
+                                message: "server busy, retry later".into(),
+                            },
+                        );
+                        break;
+                    }
                 }
-                registered = true;
             }
             Ok(DeviceIn::Update { addresses }) => {
                 if !registered {
-                    send_json(&tx, &DeviceOut::Error {
-                        message: "send register first".into(),
-                    });
+                    send_json(
+                        &tx,
+                        &DeviceOut::Error {
+                            message: "send register first".into(),
+                        },
+                    );
                     continue;
                 }
                 let addresses = normalize_addresses(addresses);
@@ -116,7 +143,6 @@ async fn handle(socket: WebSocket, state: AppState, instance_id: String) {
                             if changed {
                                 if let Some(entry) = g.devices.get_mut(&instance_id) {
                                     entry.addresses = addresses.clone();
-                                    entry.updated_at = crate::state::now_secs();
                                 }
                             }
                             changed
@@ -130,9 +156,12 @@ async fn handle(socket: WebSocket, state: AppState, instance_id: String) {
                 }
             }
             Err(_) => {
-                send_json(&tx, &DeviceOut::Error {
-                    message: "bad message".into(),
-                });
+                send_json(
+                    &tx,
+                    &DeviceOut::Error {
+                        message: "bad message".into(),
+                    },
+                );
             }
         }
     }
@@ -156,6 +185,7 @@ async fn handle(socket: WebSocket, state: AppState, instance_id: String) {
     if removed {
         broadcast_offline(&state, &instance_id).await;
     }
+    ip_release(&state, &ip).await;
 }
 
 fn send_json(tx: &Tx, out: &DeviceOut) {

@@ -15,13 +15,30 @@ use axum::{
     Json, Router,
 };
 
-use state::AppState;
+use state::{AppState, Limits};
 
 #[tokio::main]
 async fn main() {
     let bind = std::env::var("BIND").unwrap_or_else(|_| "0.0.0.0:8787".to_string());
 
-    let state = AppState::new();
+    let limits = Limits::from_env();
+    let state = AppState::new(limits);
+
+    // 后台清理：定期把「长期没有 APP 关注」的设备记录丢掉并断开连接，让插件重连补报。
+    {
+        let sweep_state = state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                let n = state::sweep(&sweep_state).await;
+                if n > 0 {
+                    println!("dsh-directory: evicted {n} idle registration(s)");
+                }
+            }
+        });
+    }
 
     let app = Router::new()
         .route("/healthz", get(healthz))
