@@ -8,8 +8,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Query, State,
     },
-    http::StatusCode,
-    response::{IntoResponse, Response},
+    response::Response,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -21,8 +20,6 @@ use crate::state::{broadcast_offline, broadcast_update, AppState, DeviceEntry, T
 #[serde(rename_all = "camelCase")]
 pub struct DeviceQuery {
     instance_id: String,
-    #[serde(default)]
-    secret: Option<String>,
 }
 
 pub async fn handler(
@@ -30,11 +27,6 @@ pub async fn handler(
     State(state): State<AppState>,
     Query(query): Query<DeviceQuery>,
 ) -> Response {
-    if let Some(expected) = &state.enroll_secret {
-        if query.secret.as_deref() != Some(expected.as_str()) {
-            return (StatusCode::UNAUTHORIZED, "invalid enrollment secret").into_response();
-        }
-    }
     let instance_id = query.instance_id;
     ws.on_upgrade(move |socket| handle(socket, state, instance_id))
 }

@@ -20,12 +20,8 @@ use state::AppState;
 #[tokio::main]
 async fn main() {
     let bind = std::env::var("BIND").unwrap_or_else(|_| "0.0.0.0:8787".to_string());
-    let enroll_secret = std::env::var("ENROLL_SECRET")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
 
-    let state = AppState::new(enroll_secret);
+    let state = AppState::new();
 
     let app = Router::new()
         .route("/healthz", get(healthz))

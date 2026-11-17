@@ -32,7 +32,6 @@ cargo run --release
 | 变量 | 说明 | 默认 |
 | --- | --- | --- |
 | `BIND` | 监听地址 | `0.0.0.0:8787` |
-| `ENROLL_SECRET` | 设备注册用的部署级口令；不配则不校验（本机 / 测试） | 空 |
 
 健康检查：`GET /healthz` → `{"ok":true,"devices":N,"watchers":M}`。
 
@@ -40,20 +39,21 @@ cargo run --release
 
 令牌不是全局共享的，而是**每台设备一个**，由这台设备的插件和它的 APP 共用：
 
-1. 设备用 `ENROLL_SECRET` 连上 `/ws/device` 注册；
+1. 设备用 `instanceId` 连上 `/ws/device` 注册（设备注册不校验来源）；
 2. 总控给这台设备发一个专属令牌（注册回包里带 `token`），插件把它存下来；
 3. 插件通过它和 APP 之间已有的那条连接，把令牌告诉 APP（这条链路不经过总控）；
 4. APP 拿着这枚令牌连 `/ws/app` 查 / 订阅这台设备。
 
-这样别人拿不到这枚令牌就查不到这台设备的地址。老用户升级插件后走的就是这条：APP 先连上
-插件，插件再从总控拿到令牌转交给它。
+令牌只保护「查地址」这一侧：别人拿不到这枚令牌就查不到这台设备的地址。设备注册本身是开放的——
+谁知道某个 `instanceId` 就能为它注册/覆盖地址，所以 `instanceId` 要当作不可猜的随机串用。
+老用户升级插件后走的就是这条：APP 先连上插件，插件再从总控拿到令牌转交给它。
 
 令牌随设备记录存在内存里，**不随设备掉线删除**（重连要拿回同一个，APP 手里那枚才不会失效），
 进程重启后清空——设备重连会拿一枚新的，插件再同步给 APP 即可。
 
 ## 协议（WebSocket + JSON）
 
-### 设备侧 `/ws/device?instanceId=<id>&secret=<ENROLL_SECRET>`
+### 设备侧 `/ws/device?instanceId=<id>`
 
 连上后先发 `register`，之后地址变化发 `update`（每次都是**整组**地址，不是增量）：
 
@@ -107,12 +107,12 @@ cargo run --release
 - 服务器：`SHIYAN`（Rocky Linux 9，x86_64），与官网共用域名 `ai-hub.wnluo.com`。
 - 后端：编译好的二进制放在 `/opt/dsh-directory/dsh-directory`，以 systemd 服务
   `dsh-directory` 常驻，只听 `127.0.0.1:8787`（不对公网暴露）。
-- 配置：`/opt/dsh-directory/dsh-directory.env`（`BIND` 与 `ENROLL_SECRET`，权限 600，不入库）。
-- 入口：宝塔站点伪静态里加一段反代，把 `https://ai-hub.wnluo.com/directory/` 转到本机后端，
+- 配置：`/opt/dsh-directory/dsh-directory.env`（只放 `BIND`，权限 600，不入库）。
+- 入口：宝塔站点伪静态里加一段反代，把 `https://ai-hub.wnluo.com/findme/` 转到本机后端，
   支持 WebSocket。片段见 `deploy/nginx-location.conf`，systemd 单元见 `deploy/dsh-directory.service`。
 
 更新流程：本机 `cargo build --release` 或把源码传上去在服务器上编，替换 `/opt/dsh-directory/dsh-directory`，
 再 `systemctl restart dsh-directory`。改了 nginx 片段才需要 `nginx -t && nginx -s reload`。
 
-上线后校验：`curl https://ai-hub.wnluo.com/directory/healthz` 应返回 `{"ok":true,...}`；
-设备/APP 的 WebSocket 走 `wss://ai-hub.wnluo.com/directory/ws/device` 与 `.../ws/app`。
+上线后校验：`curl https://ai-hub.wnluo.com/findme/healthz` 应返回 `{"ok":true,...}`；
+设备/APP 的 WebSocket 走 `wss://ai-hub.wnluo.com/findme/ws/device` 与 `.../ws/app`。

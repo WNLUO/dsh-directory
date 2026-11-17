@@ -41,16 +41,19 @@ pub struct Inner {
 #[derive(Clone)]
 pub struct AppState {
     pub inner: Arc<RwLock<Inner>>,
-    /// 设备注册用的部署级口令；未配置表示不校验（本机 / 测试）。
-    pub enroll_secret: Option<String>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(Inner::default())),
+        }
+    }
 }
 
 impl AppState {
-    pub fn new(enroll_secret: Option<String>) -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(Inner::default())),
-            enroll_secret,
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
