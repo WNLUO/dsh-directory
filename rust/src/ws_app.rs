@@ -71,10 +71,17 @@ async fn handle(socket: WebSocket, state: AppState, instance_id: String, ip: Str
     };
     let mut watching = false;
 
-    while let Some(next) = stream.next().await {
-        let msg = match next {
-            Ok(m) => m,
-            Err(_) => break,
+    // 与设备侧一致：订阅后平时没有数据，靠定时 Ping 顶住 CDN 的空闲回收，避免无谓重连。
+    loop {
+        let msg = match tokio::time::timeout(std::time::Duration::from_secs(20), stream.next()).await {
+            Ok(Some(Ok(m))) => m,
+            Ok(Some(Err(_))) | Ok(None) => break,
+            Err(_) => {
+                if tx.send(Message::Ping(Vec::new().into())).is_err() {
+                    break;
+                }
+                continue;
+            }
         };
         let text = match msg {
             Message::Text(t) => t.to_string(),

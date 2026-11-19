@@ -52,6 +52,7 @@ async fn handle(
     provided_token: Option<String>,
 ) {
     ip_acquire(&state, &ip).await;
+    let started = std::time::Instant::now();
 
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
@@ -69,11 +70,29 @@ async fn handle(
         g.next_conn
     };
     let mut registered = false;
+    #[allow(unused_assignments)]
+    let mut reason: &'static str = "closed";
 
-    while let Some(next) = stream.next().await {
-        let msg = match next {
-            Ok(m) => m,
-            Err(_) => break,
+    // 空闲长连接需要心跳：设备注册后平时不发数据，前面的 CDN 会按空闲把连接掐掉，
+    // 设备于是不断重连、握手 QPS 虚高。每 20 秒发一次 Ping，标准客户端会自动回 Pong。
+    loop {
+        let msg = match tokio::time::timeout(std::time::Duration::from_secs(20), stream.next()).await {
+            Ok(Some(Ok(m))) => m,
+            Ok(Some(Err(_))) => {
+                reason = "peer_err";
+                break;
+            }
+            Ok(None) => {
+                reason = "peer_eof";
+                break;
+            }
+            Err(_) => {
+                if tx.send(Message::Ping(Vec::new().into())).is_err() {
+                    reason = "hb_send_fail";
+                    break;
+                }
+                continue;
+            }
         };
         let text = match msg {
             Message::Text(t) => t.to_string(),
@@ -81,17 +100,25 @@ async fn handle(
                 let _ = tx.send(Message::Pong(p));
                 continue;
             }
-            Message::Close(_) => break,
+            Message::Close(_) => {
+                reason = "client_close";
+                break;
+            }
             _ => continue,
         };
         match serde_json::from_str::<DeviceIn>(&text) {
             Ok(DeviceIn::Register { payload }) => {
                 if payload.len() > MAX_PAYLOAD_BYTES {
                     send_json(&tx, &DeviceOut::Error { message: "payload too large".into() });
+                    reason = "payload_too_large";
                     break;
                 }
                 let now = now_secs();
                 let limits = state.limits.clone();
+                let had_existing = {
+                    let g = state.inner.read().await;
+                    g.devices.contains_key(&instance_id)
+                };
                 let outcome = {
                     let mut g = state.inner.write().await;
                     g.register(
@@ -118,17 +145,38 @@ async fn handle(
                         );
                         broadcast_update(&state, &instance_id, &payload).await;
                         registered = true;
+                        eprintln!(
+                            "diag register id={} ip={} outcome=ok replaced={} token={}",
+                            instance_id,
+                            ip,
+                            had_existing,
+                            provided_token.is_some()
+                        );
                     }
                     RegisterOutcome::RateLimited => {
+                        eprintln!("diag register id={} ip={} outcome=rate_limited", instance_id, ip);
                         send_json(&tx, &DeviceOut::Error { message: "rate limited, retry later".into() });
+                        reason = "rate_limited";
                         break;
                     }
                     RegisterOutcome::Full => {
+                        eprintln!("diag register id={} ip={} outcome=server_full", instance_id, ip);
                         send_json(&tx, &DeviceOut::Error { message: "server busy, retry later".into() });
+                        reason = "server_full";
                         break;
                     }
                     RegisterOutcome::Unauthorized => {
-                        send_json(&tx, &DeviceOut::Error { message: "unauthorized".into() });
+                        eprintln!(
+                            "diag register id={} ip={} outcome=unauthorized token={}",
+                            instance_id,
+                            ip,
+                            provided_token.is_some()
+                        );
+                        // 明确的「身份冲突」而不是笼统的 unauthorized：这个 id 已经有别的令牌在用了
+                        // （同一 instanceId 被多台机器/多进程共用，或本机令牌丢了）。客户端据此走
+                        // 「换身份或长退避」而不是当成一次性网络错误重试。
+                        send_json(&tx, &DeviceOut::Error { message: "identity_conflict".into() });
+                        reason = "unauthorized";
                         break;
                     }
                 }
@@ -168,23 +216,29 @@ async fn handle(
 
     // 连接结束：只有「登记这条记录的仍是当前连接」时才删除并广播离线，避免重连竞态里
     // 旧连接把新记录清掉。
-    let removed = {
+    let (removed, superseded) = {
         let mut g = state.inner.write().await;
-        let owned = g
-            .devices
-            .get(&instance_id)
-            .map(|d| d.conn_id == conn_id)
-            .unwrap_or(false);
+        let current = g.devices.get(&instance_id).map(|d| d.conn_id);
+        let owned = current == Some(conn_id);
         if owned {
             g.devices.remove(&instance_id);
         }
-        owned
+        (owned, registered && current.is_some() && current != Some(conn_id))
     };
     drop(tx);
     let _ = writer.await;
     if removed {
         broadcast_offline(&state, &instance_id).await;
     }
+    eprintln!(
+        "diag conn_end id={} ip={} dur_ms={} registered={} superseded={} reason={}",
+        instance_id,
+        ip,
+        started.elapsed().as_millis(),
+        registered,
+        superseded,
+        if superseded { "superseded" } else { reason }
+    );
     ip_release(&state, &ip).await;
 }
 
