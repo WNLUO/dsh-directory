@@ -1,2 +1,5 @@
+# 构建产物、日志与本地令牌状态不入库。
 /rust/target/
+/rust/data/
+/data/
 *.log

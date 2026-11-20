@@ -1,4 +1,4 @@
-//! 设备侧长连接（`/ws/device`）。
+//! 设备侧长连接：注册令牌持久成功后才回执并发布在线地址。
 //!
 //! 设备（插件宿主）主动连上来，报 `instanceId` 与一份**加密载荷**（全部连接地址封在里面，
 //! 总控不解析）；连接一断，这台就算离线，订阅它的 APP 会收到一条离线事件。载荷没变化时
@@ -163,6 +163,11 @@ async fn handle(
                         eprintln!("diag register id={} ip={} outcome=server_full", instance_id, ip);
                         send_json(&tx, &DeviceOut::Error { message: "server busy, retry later".into() });
                         reason = "server_full";
+                        break;
+                    }
+                    RegisterOutcome::StorageUnavailable => {
+                        send_json(&tx, &DeviceOut::Error { message: "server busy, retry later".into() });
+                        reason = "token_store_unavailable";
                         break;
                     }
                     RegisterOutcome::Unauthorized => {

@@ -1,19 +1,15 @@
-//! 公用中转总控（地址目录）。
+//! 总控入口：加载持久令牌，启动只在内存保留在线地址的目录服务。
 //!
 //! 两件事：设备（插件宿主）用长连接把可用地址报上来；APP 用长连接查 / 订阅这些地址。
-//! 全内存、无数据库，地址没变化时不推送，链路保持静默。
+//! 在线地址无数据库，地址没变化时不推送，链路保持静默。
 
 mod model;
 mod state;
+mod token_store;
 mod ws_app;
 mod ws_device;
 
-use axum::{
-    extract::State,
-    response::IntoResponse,
-    routing::get,
-    Json, Router,
-};
+use axum::{extract::State, response::IntoResponse, routing::get, Json, Router};
 
 use state::{AppState, Limits};
 
@@ -22,7 +18,19 @@ async fn main() {
     let bind = std::env::var("BIND").unwrap_or_else(|_| "0.0.0.0:8787".to_string());
 
     let limits = Limits::from_env();
-    let state = AppState::new(limits);
+    let token_path = std::env::var_os("TOKEN_STORE_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| "data/tokens.jsonl".into());
+    let state = match AppState::open(limits, &token_path) {
+        Ok(state) => state,
+        Err(error) => {
+            eprintln!(
+                "dsh-directory: open token store {} failed: {error}",
+                token_path.display()
+            );
+            std::process::exit(1);
+        }
+    };
 
     let app = Router::new()
         .route("/healthz", get(healthz))

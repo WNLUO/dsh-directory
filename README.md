@@ -1,3 +1,4 @@
+<!-- 总控协议、令牌持久化和单实例部署约定。 -->
 # dsh-directory
 
 公用中转的**总控 / 地址目录**。只干一件事：知道「哪台设备现在挂在哪、能用哪些地址连它」。
@@ -5,7 +6,7 @@
 - 设备（插件宿主）用长连接把当前所有可用地址报到总控；
 - APP 用长连接向总控查 / 订阅这些地址；
 - 地址没变化时**一个字都不推**，链路保持静默；
-- 全内存、无数据库，进程重启后设备重连即恢复。
+- 在线地址与订阅只放内存；设备令牌独立落盘，重启后继续使用原令牌查询新上报的地址。
 
 这是本项目的后端。以后要做的管理前端放在同一目录的另一个子文件夹里（例如 `web/`），
 和后端分开。
@@ -32,6 +33,7 @@ cargo run --release
 | 变量 | 说明 | 默认 |
 | --- | --- | --- |
 | `BIND` | 监听地址 | `0.0.0.0:8787` |
+| `TOKEN_STORE_PATH` | 设备令牌日志路径；目录须可写，现有文件读取失败则拒绝启动 | `data/tokens.jsonl` |
 | `MAX_DEVICES` | 设备记录总量上限 | `100000` |
 | `MAX_TOKENS` | 设备令牌记录总量上限（超出按最久未注册淘汰） | `200000` |
 | `MAX_CONNS_PER_IP` | 单来源 IP 的并发连接上限 | `50` |
@@ -51,9 +53,15 @@ cargo run --release
 - 插件把令牌经「插件↔APP」已有链路交给 APP；APP 用同一把 HK 解开载荷。HK 只在配对时下发给这台
   设备的手机，总控永远拿不到。
 
-令牌只保护「查/订阅」这一侧：拿不出令牌就查不到。载荷内容对总控不透明，所以哪怕有人知道
-instanceId，也只能看到一段解不开的密文。令牌随设备记录存在内存里，不随掉线删除，进程重启后
-清空（设备重连换新令牌，插件再同步给 APP）。
+令牌同时校验设备重连与 APP 查/订阅：拿不出已有令牌就不能覆盖设备地址或读取载荷。载荷内容
+对总控不透明，APP 还需要自身的 HK 才能解开。
+
+令牌及最近注册时间写入 `TOKEN_STORE_PATH`，注册成功前完成持久写入；总控重启后继续校验同一枚
+令牌。设备在线地址、连接和订阅不落盘，重启后 APP 可用原令牌先订阅，等待插件重新上报新地址。
+日志按容量保留令牌并定期压缩；令牌文件丢失会重新签发，损坏或不可写不会静默退回空令牌表。
+
+首次从纯内存版本升级时，没有可导入的历史令牌文件；插件会按原流程收到新令牌并转交 APP。
+升级后的后续重启只要保留令牌文件，就不再换令牌。
 
 ## 端到端加密（总控是盲的）
 
@@ -94,7 +102,7 @@ APP 用 HK 解 `payload`。**静默规则**：只有在明文地址真变化时�
 
 ## 防滥用与容量
 
-注册没有额外口令，就靠「令牌绑定 + 容量上限 + 限速」把口子收住，全在内存里：
+注册没有额外口令，就靠「令牌绑定 + 容量上限 + 限速」把口子收住；令牌持久化，在线计数和限速驻内存：
 
 - **令牌绑定防冒充**：一台设备首次注册拿到一枚令牌，之后重连/覆盖必须带同一枚；只知道
   `instanceId`、拿不出令牌的人改不动别人的地址、也查不了。
@@ -108,9 +116,9 @@ APP 用 HK 解 `payload`。**静默规则**：只有在明文地址真变化时�
 
 ## 设计取舍
 
-- **内存而非数据库**：这一层就是一张「设备 → 地址」的即时表，设备是长连接、断线即失效，
-  落盘意义不大。单进程足够；要水平扩容或重启不丢，把状态层换成 Redis 即可（`state.rs` 是
-  唯一碰状态的地方）。
+- **在线状态只放内存**：这一层是「设备 → 地址」的即时表，设备断线即失效，重启不恢复旧地址。
+  只有鉴权令牌通过追加日志落盘，避免重启让 APP 失去兜底查询能力；当前为单实例，令牌文件不能由
+  多个进程同时写入。
 - **令牌不校验 APP 是不是真的那台设备**：只校验它拿到了那台设备的令牌。设备与 APP 的信任
   建立在它们自己那条链路上，总控不掺和。
 - **不做流量代理**：数据面（APP 直连中转）不经过总控，总控只在「查地址」这一刻出现，
@@ -121,12 +129,19 @@ APP 用 HK 解 `payload`。**静默规则**：只有在明文地址真变化时�
 - 服务器：`SHIYAN`（Rocky Linux 9，x86_64），与官网共用域名 `ai-hub.wnluo.com`。
 - 后端：编译好的二进制放在 `/opt/dsh-directory/dsh-directory`，以 systemd 服务
   `dsh-directory` 常驻，只听 `127.0.0.1:8787`（不对公网暴露）。
-- 配置：`/opt/dsh-directory/dsh-directory.env`（只放 `BIND`，权限 600，不入库）。
+- 配置：`/opt/dsh-directory/dsh-directory.env`（`BIND` 等环境覆盖，权限 600，不入库）。
+- 令牌：systemd 单元通过 `StateDirectory` 创建 `/var/lib/dsh-directory`（服务用户可写、目录 700），
+  `TOKEN_STORE_PATH=/var/lib/dsh-directory/tokens.jsonl`；新文件权限 600。更新二进制或重启服务须保留
+  该目录，并纳入备份；不把令牌文件放进源码或发布包。容器部署须给该路径挂持久卷。
 - 入口：宝塔站点伪静态里加一段反代，把 `https://ai-hub.wnluo.com/findme/` 转到本机后端，
   支持 WebSocket。片段见 `deploy/nginx-location.conf`，systemd 单元见 `deploy/dsh-directory.service`。
 
 更新流程：本机 `cargo build --release` 或把源码传上去在服务器上编，替换 `/opt/dsh-directory/dsh-directory`，
-再 `systemctl restart dsh-directory`。改了 nginx 片段才需要 `nginx -t && nginx -s reload`。
+再 `systemctl restart dsh-directory`。首次更新服务单元需执行 `systemctl daemon-reload`。改了 nginx
+片段才需要 `nginx -t && nginx -s reload`。
+
+定向验证：`cd rust && cargo test --locked state::tests && cargo test --locked token_store::tests`。测试使用
+独立临时目录，不读取或写入部署令牌文件。
 
 上线后校验：`curl https://ai-hub.wnluo.com/findme/healthz` 应返回 `{"ok":true,...}`；
 设备/APP 的 WebSocket 走 `wss://ai-hub.wnluo.com/findme/ws/device` 与 `.../ws/app`。

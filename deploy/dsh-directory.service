@@ -1,3 +1,4 @@
+# 总控服务：在线地址驻内存，令牌保存在systemd管理的持久目录。
 [Unit]
 Description=DSH Directory (public relay control plane / address directory)
 After=network-online.target
@@ -8,6 +9,9 @@ Type=simple
 User=www
 Group=www
 WorkingDirectory=/opt/dsh-directory
+StateDirectory=dsh-directory
+StateDirectoryMode=0700
+Environment=TOKEN_STORE_PATH=/var/lib/dsh-directory/tokens.jsonl
 EnvironmentFile=/opt/dsh-directory/dsh-directory.env
 ExecStart=/opt/dsh-directory/dsh-directory
 Restart=always

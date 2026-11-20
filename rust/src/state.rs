@@ -1,11 +1,11 @@
-//! 全内存的共享状态：设备记录、每台设备的令牌、订阅者，以及防滥用所需的计数与限速。
+//! 目录状态与注册鉴权：令牌持久保留，在线设备、订阅和限速只在本进程内有效。
 //!
-//! 设备记录里存的是一段**不透明密文载荷**（`payload`）——总控不解析、不持钥。进程重启后
-//! 全部清空；设备是长连接，会自动重连并重新上报。真要做多实例 / 重启不丢，把这一层换成
-//! Redis 即可（见 README）。
+//! 设备记录是不透明密文；重启后等待设备重新上报，不恢复过期的在线地址。
 
 use std::{
     collections::HashMap,
+    io,
+    path::Path,
     sync::Arc,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -14,6 +14,7 @@ use axum::{extract::ws::Message, http::HeaderMap};
 use tokio::sync::{mpsc, RwLock};
 
 use crate::model::AppOut;
+use crate::token_store::{TokenEntry, TokenStore};
 
 /// 一条连接的出站通道。写线程独占 socket 的写端，其它地方往这里丢消息。
 pub type Tx = mpsc::UnboundedSender<Message>;
@@ -35,13 +36,22 @@ pub struct Limits {
 impl Limits {
     pub fn from_env() -> Self {
         fn usizev(k: &str, d: usize) -> usize {
-            std::env::var(k).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(d)
+            std::env::var(k)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(d)
         }
         fn u32v(k: &str, d: u32) -> u32 {
-            std::env::var(k).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(d)
+            std::env::var(k)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(d)
         }
         fn f64v(k: &str, d: f64) -> f64 {
-            std::env::var(k).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(d)
+            std::env::var(k)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(d)
         }
         Self {
             max_devices: usizev("MAX_DEVICES", 100_000),
@@ -92,13 +102,6 @@ pub struct DeviceEntry {
     pub control: Tx,
 }
 
-/// 一台设备的令牌与「最近一次来注册」的时间。令牌不随设备断开删除（重连要拿回同一个），
-/// 只在超过总量上限时按最久未注册淘汰。
-pub struct TokenEntry {
-    pub token: String,
-    pub last_seen: u64,
-}
-
 /// 一次注册的处理结果。
 pub enum RegisterOutcome {
     Ok {
@@ -112,6 +115,8 @@ pub enum RegisterOutcome {
     Full,
     /// 这台设备已经登记过令牌，但这次没带上同一枚 —— 视为冒充，拒绝。
     Unauthorized,
+    /// 令牌未能持久化，不能向客户端承诺注册成功。
+    StorageUnavailable,
 }
 
 pub struct Inner {
@@ -127,6 +132,7 @@ pub struct Inner {
     pub next_conn: u64,
     pub next_watcher: u64,
     reg_bucket: RateBucket,
+    token_store: Option<TokenStore>,
 }
 
 impl Inner {
@@ -139,25 +145,29 @@ impl Inner {
             next_conn: 0,
             next_watcher: 0,
             reg_bucket: RateBucket::new(burst),
+            token_store: None,
         }
     }
 
-    /// 超过令牌上限时，淘汰最久没来注册的那些，直到降回上限以内。
-    fn trim_tokens(&mut self, max: usize) {
-        let max = max.max(1);
-        if self.tokens.len() <= max {
-            return;
+    /// 返回本次成功注册后需要淘汰的旧令牌，持久化失败时不改现有鉴权。
+    fn token_victims(&self, instance_id: &str, max: usize) -> Vec<String> {
+        let total = self.tokens.len() + usize::from(!self.tokens.contains_key(instance_id));
+        if total <= max.max(1) {
+            return Vec::new();
         }
-        let mut entries: Vec<(String, u64)> = self
+        let mut entries: Vec<(&str, u64)> = self
             .tokens
             .iter()
-            .map(|(id, entry)| (id.clone(), entry.last_seen))
+            .filter(|(id, _)| id.as_str() != instance_id)
+            .map(|(id, entry)| (id.as_str(), entry.last_seen))
             .collect();
-        entries.sort_by_key(|(_, last)| *last);
-        let remove = self.tokens.len() - max;
-        for (id, _) in entries.into_iter().take(remove) {
-            self.tokens.remove(&id);
-        }
+        entries.sort_by_key(|(id, last)| (*last, *id));
+        let remove = (entries.len() + 1).saturating_sub(max.max(1));
+        entries
+            .into_iter()
+            .take(remove)
+            .map(|(id, _)| id.to_string())
+            .collect()
     }
 
     /// 收下一次设备注册：限速 → 校验令牌（防冒充）→ 满则淘汰「最久没人查」的 → 写记录、发令牌。
@@ -179,7 +189,7 @@ impl Inner {
         }
 
         // 授权：已登记过令牌的设备，重连/覆盖时必须带同一枚；否则当成冒充拒绝。
-        // 首次注册（process 重启后 map 为空、或新设备）则发一枚新令牌。
+        // 本地令牌表没有记录才签发新令牌，不采信客户端自带的未知令牌。
         let token = match self.tokens.get(instance_id) {
             Some(entry) => match provided_token {
                 Some(p) if p == entry.token => entry.token.clone(),
@@ -189,28 +199,44 @@ impl Inner {
         };
 
         let exists = self.devices.contains_key(instance_id);
-        let mut evicted = Vec::new();
-        if !exists && self.devices.len() >= limits.max_devices {
-            // 只淘汰「没有活跃订阅」的记录；在它们之间挑「最久没被 APP 查」的。
-            let victim = {
-                let devices = &self.devices;
-                let watchers = &self.watchers;
-                devices
-                    .iter()
-                    .filter(|(id, _)| watchers.get(*id).map(|m| m.is_empty()).unwrap_or(true))
-                    .min_by_key(|(_, e)| e.last_app_interest)
-                    .map(|(id, _)| id.clone())
-            };
-            match victim {
-                Some(vid) => {
-                    if let Some(entry) = self.devices.remove(&vid) {
-                        evicted.push(entry.control);
-                    }
-                }
+        let victim = if !exists && self.devices.len() >= limits.max_devices {
+            let candidate = self
+                .devices
+                .iter()
+                .filter(|(id, _)| self.watchers.get(*id).map(|m| m.is_empty()).unwrap_or(true))
+                .min_by_key(|(_, entry)| entry.last_app_interest)
+                .map(|(id, _)| id.clone());
+            match candidate {
+                Some(id) => Some(id),
                 None => return RegisterOutcome::Full,
             }
+        } else {
+            None
+        };
+        let entry = TokenEntry {
+            token: token.clone(),
+            last_seen: now,
+        };
+        let removed = self.token_victims(instance_id, limits.max_tokens);
+        if let Some(store) = &mut self.token_store {
+            if let Err(error) = store.record(instance_id, &entry, removed.clone()) {
+                eprintln!("token store: registration write failed: {error}");
+                return RegisterOutcome::StorageUnavailable;
+            }
         }
-
+        self.tokens.insert(instance_id.to_string(), entry);
+        for id in removed {
+            self.tokens.remove(&id);
+        }
+        if let Some(store) = &mut self.token_store {
+            if let Err(error) = store.compact_if_needed(&self.tokens) {
+                eprintln!("token store: compaction failed: {error}");
+            }
+        }
+        let mut evicted = Vec::new();
+        if let Some(entry) = victim.and_then(|id| self.devices.remove(&id)) {
+            evicted.push(entry.control);
+        }
         self.devices.insert(
             instance_id.to_string(),
             DeviceEntry {
@@ -220,14 +246,6 @@ impl Inner {
                 control,
             },
         );
-        self.tokens.insert(
-            instance_id.to_string(),
-            TokenEntry {
-                token: token.clone(),
-                last_seen: now,
-            },
-        );
-        self.trim_tokens(limits.max_tokens);
         RegisterOutcome::Ok { token, evicted }
     }
 }
@@ -239,12 +257,15 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(limits: Limits) -> Self {
-        let burst = limits.reg_burst;
-        Self {
-            inner: Arc::new(RwLock::new(Inner::new(burst))),
+    pub fn open(limits: Limits, token_path: &Path) -> io::Result<Self> {
+        let (store, tokens) = TokenStore::open(token_path)?;
+        let mut inner = Inner::new(limits.reg_burst);
+        inner.tokens = tokens;
+        inner.token_store = Some(store);
+        Ok(Self {
+            inner: Arc::new(RwLock::new(inner)),
             limits,
-        }
+        })
     }
 }
 
@@ -354,104 +375,5 @@ pub async fn broadcast_offline(state: &AppState, instance_id: &str) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn limits(max_devices: usize, reg_per_sec: f64, reg_burst: f64, max_tokens: usize) -> Limits {
-        Limits {
-            max_devices,
-            max_tokens,
-            max_conns_per_ip: 50,
-            reg_per_sec,
-            reg_burst,
-        }
-    }
-
-    fn tx() -> Tx {
-        let (tx, rx) = mpsc::unbounded_channel::<Message>();
-        std::mem::forget(rx);
-        tx
-    }
-
-    #[test]
-    fn rate_limit_rejects_after_burst() {
-        let l = limits(100, 0.0, 1.0, 1000);
-        let mut inner = Inner::new(1.0);
-        assert!(matches!(
-            inner.register("a", 1, "pa".into(), tx(), None, 1000, &l),
-            RegisterOutcome::Ok { .. }
-        ));
-        assert!(matches!(
-            inner.register("b", 2, "pb".into(), tx(), None, 1000, &l),
-            RegisterOutcome::RateLimited
-        ));
-    }
-
-    #[test]
-    fn over_capacity_evicts_least_recently_interested() {
-        let l = limits(1, 1000.0, 1000.0, 1000);
-        let mut inner = Inner::new(1000.0);
-        assert!(matches!(
-            inner.register("a", 1, "pa".into(), tx(), None, 100, &l),
-            RegisterOutcome::Ok { .. }
-        ));
-        match inner.register("b", 2, "pb".into(), tx(), None, 200, &l) {
-            RegisterOutcome::Ok { evicted, .. } => assert_eq!(evicted.len(), 1),
-            _ => panic!("expected ok"),
-        }
-        assert!(inner.devices.contains_key("b"));
-        assert!(!inner.devices.contains_key("a"));
-    }
-
-    #[test]
-    fn full_when_everything_is_watched() {
-        let l = limits(1, 1000.0, 1000.0, 1000);
-        let mut inner = Inner::new(1000.0);
-        assert!(matches!(
-            inner.register("a", 1, "pa".into(), tx(), None, 100, &l),
-            RegisterOutcome::Ok { .. }
-        ));
-        inner.watchers.entry("a".into()).or_default().insert(1, tx());
-        assert!(matches!(
-            inner.register("b", 2, "pb".into(), tx(), None, 200, &l),
-            RegisterOutcome::Full
-        ));
-    }
-
-    #[test]
-    fn re_register_requires_matching_token() {
-        let l = limits(100, 1000.0, 1000.0, 1000);
-        let mut inner = Inner::new(1000.0);
-        let first = match inner.register("a", 1, "pa".into(), tx(), None, 100, &l) {
-            RegisterOutcome::Ok { token, .. } => token,
-            _ => panic!("expected ok"),
-        };
-        assert!(matches!(
-            inner.register("a", 2, "pa".into(), tx(), None, 200, &l),
-            RegisterOutcome::Unauthorized
-        ));
-        assert!(matches!(
-            inner.register("a", 2, "pa".into(), tx(), Some("wrong"), 200, &l),
-            RegisterOutcome::Unauthorized
-        ));
-        match inner.register("a", 2, "pa".into(), tx(), Some(&first), 200, &l) {
-            RegisterOutcome::Ok { token, .. } => assert_eq!(token, first),
-            _ => panic!("expected ok"),
-        }
-    }
-
-    #[test]
-    fn token_map_is_capped() {
-        let l = limits(100, 1000.0, 1000.0, 2);
-        let mut inner = Inner::new(1000.0);
-        for (i, id) in ["a", "b", "c"].iter().enumerate() {
-            assert!(matches!(
-                inner.register(id, i as u64 + 1, "p".into(), tx(), None, 100 + i as u64, &l),
-                RegisterOutcome::Ok { .. }
-            ));
-        }
-        assert!(inner.tokens.len() <= 2, "tokens={}", inner.tokens.len());
-        assert!(!inner.tokens.contains_key("a"));
-        assert!(inner.tokens.contains_key("c"));
-    }
-}
+#[path = "state_tests.rs"]
+mod tests;
