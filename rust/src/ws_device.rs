@@ -1,4 +1,4 @@
-//! 设备侧长连接：注册令牌持久成功后才回执并发布在线地址。
+//! 设备侧长连接：注册令牌持久成功后才回执并发布在线地址。 入站静默超时回收且不等待阻塞写端。
 //!
 //! 设备（插件宿主）主动连上来，报 `instanceId` 与一份**加密载荷**（全部连接地址封在里面，
 //! 总控不解析）；连接一断，这台就算离线，订阅它的 APP 会收到一条离线事件。载荷没变化时
@@ -17,8 +17,8 @@ use serde::Deserialize;
 
 use crate::model::{DeviceIn, DeviceOut, MAX_PAYLOAD_BYTES};
 use crate::state::{
-    broadcast_offline, broadcast_update, client_ip, ip_acquire, ip_has_room, ip_release, now_secs,
-    AppState, RegisterOutcome, Tx,
+    broadcast_update, client_ip, ip_acquire, ip_has_room, ip_release, now_secs,
+    AppState, RegisterOutcome, Tx, receive_ws, stop_writer, WS_IDLE_TIMEOUT, WS_PING_INTERVAL,
 };
 
 #[derive(Debug, Deserialize)]
@@ -58,9 +58,8 @@ async fn handle(
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
     let writer = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            if sink.send(msg).await.is_err() {
-                break;
-            }
+            let closing = matches!(&msg, Message::Close(_));
+            if sink.send(msg).await.is_err() || closing { break; }
         }
     });
 
@@ -73,26 +72,11 @@ async fn handle(
     #[allow(unused_assignments)]
     let mut reason: &'static str = "closed";
 
-    // 空闲长连接需要心跳：设备注册后平时不发数据，前面的 CDN 会按空闲把连接掐掉，
-    // 设备于是不断重连、握手 QPS 虚高。每 20 秒发一次 Ping，标准客户端会自动回 Pong。
+    let mut last_received = tokio::time::Instant::now();
     loop {
-        let msg = match tokio::time::timeout(std::time::Duration::from_secs(20), stream.next()).await {
-            Ok(Some(Ok(m))) => m,
-            Ok(Some(Err(_))) => {
-                reason = "peer_err";
-                break;
-            }
-            Ok(None) => {
-                reason = "peer_eof";
-                break;
-            }
-            Err(_) => {
-                if tx.send(Message::Ping(Vec::new().into())).is_err() {
-                    reason = "hb_send_fail";
-                    break;
-                }
-                continue;
-            }
+        let msg = match receive_ws(&mut stream, &tx, &mut last_received, WS_PING_INTERVAL, WS_IDLE_TIMEOUT).await {
+            Ok(message) => message,
+            Err(why) => { reason = why; break; }
         };
         let text = match msg {
             Message::Text(t) => t.to_string(),
@@ -221,20 +205,12 @@ async fn handle(
 
     // 连接结束：只有「登记这条记录的仍是当前连接」时才删除并广播离线，避免重连竞态里
     // 旧连接把新记录清掉。
-    let (removed, superseded) = {
+    let (_, superseded) = {
         let mut g = state.inner.write().await;
-        let current = g.devices.get(&instance_id).map(|d| d.conn_id);
-        let owned = current == Some(conn_id);
-        if owned {
-            g.devices.remove(&instance_id);
-        }
-        (owned, registered && current.is_some() && current != Some(conn_id))
+        g.disconnect_device(&instance_id, conn_id, registered)
     };
     drop(tx);
-    let _ = writer.await;
-    if removed {
-        broadcast_offline(&state, &instance_id).await;
-    }
+    stop_writer(writer).await;
     eprintln!(
         "diag conn_end id={} ip={} dur_ms={} registered={} superseded={} reason={}",
         instance_id,

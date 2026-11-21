@@ -1,4 +1,4 @@
-//! 目录状态与注册鉴权：令牌持久保留，在线设备、订阅和限速只在本进程内有效。
+//! 目录状态与注册鉴权：有效令牌重连不占新注册配额，静默死链按单调期限回收。
 //!
 //! 设备记录是不透明密文；重启后等待设备重新上报，不恢复过期的在线地址。
 
@@ -7,17 +7,53 @@ use std::{
     io,
     path::Path,
     sync::Arc,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{extract::ws::Message, http::HeaderMap};
 use tokio::sync::{mpsc, RwLock};
+use futures_util::{Stream, StreamExt};
 
 use crate::model::AppOut;
 use crate::token_store::{TokenEntry, TokenStore};
 
 /// 一条连接的出站通道。写线程独占 socket 的写端，其它地方往这里丢消息。
 pub type Tx = mpsc::UnboundedSender<Message>;
+
+pub const WS_PING_INTERVAL: Duration = Duration::from_secs(20);
+pub const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Ping 只保活代理；入站帧才延长活跃期限，排入写队列不算对端活着。
+pub async fn receive_ws<S, E>(
+    stream: &mut S, tx: &Tx, last_received: &mut tokio::time::Instant,
+    ping_interval: Duration, idle_timeout: Duration,
+) -> Result<Message, &'static str>
+where S: Stream<Item = Result<Message, E>> + Unpin {
+    loop {
+        let deadline = *last_received + idle_timeout;
+        let next_ping = (tokio::time::Instant::now() + ping_interval).min(deadline);
+        match tokio::time::timeout_at(next_ping, stream.next()).await {
+            Ok(Some(Ok(message))) => {
+                *last_received = tokio::time::Instant::now();
+                return Ok(message);
+            }
+            Ok(Some(Err(_))) => return Err("peer_err"),
+            Ok(None) => return Err("peer_eof"),
+            Err(_) if tokio::time::Instant::now() >= deadline => return Err("hb_timeout"),
+            Err(_) => {
+                if tx.send(Message::Ping(Vec::new().into())).is_err() { return Err("hb_send_fail"); }
+            }
+        }
+    }
+}
+
+/// 给已排队的错误/关闭帧一个短收尾窗口，阻塞写端不能无限拖住离线和配额回收。
+pub async fn stop_writer(mut writer: tokio::task::JoinHandle<()>) {
+    if tokio::time::timeout(Duration::from_millis(250), &mut writer).await.is_err() {
+        writer.abort();
+        let _ = writer.await;
+    }
+}
 
 /// 防滥用 / 容量的可调参数，全部有默认值，可用环境变量覆盖。
 #[derive(Clone)]
@@ -149,6 +185,25 @@ impl Inner {
         }
     }
 
+    /// 旧连接退出不能清掉已经接替它的新地址。
+    pub fn disconnect_device(&mut self, instance_id: &str, conn_id: u64, registered: bool) -> (bool, bool) {
+        let current = self.devices.get(instance_id).map(|device| device.conn_id);
+        let owned = current == Some(conn_id);
+        if owned {
+            self.devices.remove(instance_id);
+            self.broadcast_device(instance_id, AppOut::Offline { instance_id: instance_id.to_string() });
+        }
+        (owned, registered && current.is_some() && current != Some(conn_id))
+    }
+
+    /// 调用方持状态锁，消息直接入订阅队列，不在变更与事件之间让出执行权。
+    fn broadcast_device(&self, instance_id: &str, event: AppOut) {
+        let Ok(payload) = serde_json::to_string(&event) else { return };
+        if let Some(watchers) = self.watchers.get(instance_id) {
+            for sender in watchers.values() { let _ = sender.send(Message::Text(payload.clone().into())); }
+        }
+    }
+
     /// 返回本次成功注册后需要淘汰的旧令牌，持久化失败时不改现有鉴权。
     fn token_victims(&self, instance_id: &str, max: usize) -> Vec<String> {
         let total = self.tokens.len() + usize::from(!self.tokens.contains_key(instance_id));
@@ -170,7 +225,7 @@ impl Inner {
             .collect()
     }
 
-    /// 收下一次设备注册：限速 → 校验令牌（防冒充）→ 满则淘汰「最久没人查」的 → 写记录、发令牌。
+    /// 收下一次设备注册：校验令牌 → 新身份限速 → 容量与持久化 → 发布在线记录。
     pub fn register(
         &mut self,
         instance_id: &str,
@@ -181,13 +236,6 @@ impl Inner {
         now: u64,
         limits: &Limits,
     ) -> RegisterOutcome {
-        if !self
-            .reg_bucket
-            .try_take(limits.reg_per_sec, limits.reg_burst, Instant::now())
-        {
-            return RegisterOutcome::RateLimited;
-        }
-
         // 授权：已登记过令牌的设备，重连/覆盖时必须带同一枚；否则当成冒充拒绝。
         // 本地令牌表没有记录才签发新令牌，不采信客户端自带的未知令牌。
         let token = match self.tokens.get(instance_id) {
@@ -195,7 +243,12 @@ impl Inner {
                 Some(p) if p == entry.token => entry.token.clone(),
                 _ => return RegisterOutcome::Unauthorized,
             },
-            None => uuid::Uuid::new_v4().to_string(),
+            None => {
+                if !self.reg_bucket.try_take(limits.reg_per_sec, limits.reg_burst, Instant::now()) {
+                    return RegisterOutcome::RateLimited;
+                }
+                uuid::Uuid::new_v4().to_string()
+            }
         };
 
         let exists = self.devices.contains_key(instance_id);
@@ -335,43 +388,10 @@ pub async fn snapshot(state: &AppState, instance_id: &str) -> (bool, Option<Stri
 
 /// 载荷有变化时，只通知正在订阅这台设备的 APP。没订阅者就什么都不做（链路自然静默）。
 pub async fn broadcast_update(state: &AppState, instance_id: &str, payload: &str) {
-    let message = match serde_json::to_string(&AppOut::Update {
-        instance_id: instance_id.to_string(),
-        payload: payload.to_string(),
-    }) {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-    let txs: Vec<Tx> = {
-        let g = state.inner.read().await;
-        g.watchers
-            .get(instance_id)
-            .map(|m| m.values().cloned().collect())
-            .unwrap_or_default()
-    };
-    for tx in txs {
-        let _ = tx.send(Message::Text(message.clone().into()));
-    }
-}
-
-/// 设备断开时通知订阅者。
-pub async fn broadcast_offline(state: &AppState, instance_id: &str) {
-    let message = match serde_json::to_string(&AppOut::Offline {
-        instance_id: instance_id.to_string(),
-    }) {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-    let txs: Vec<Tx> = {
-        let g = state.inner.read().await;
-        g.watchers
-            .get(instance_id)
-            .map(|m| m.values().cloned().collect())
-            .unwrap_or_default()
-    };
-    for tx in txs {
-        let _ = tx.send(Message::Text(message.clone().into()));
-    }
+    let g = state.inner.read().await;
+    g.broadcast_device(instance_id, AppOut::Update {
+        instance_id: instance_id.to_string(), payload: payload.to_string(),
+    });
 }
 
 #[cfg(test)]

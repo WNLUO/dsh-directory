@@ -1,4 +1,4 @@
-//! 注册限速、容量、鉴权与持久令牌恢复的状态层验证。
+//! 新身份限速、死链期限、阻塞写端回收及持久令牌恢复的行为验证。
 
 use super::*;
 
@@ -252,4 +252,99 @@ async fn failed_persistence_does_not_publish_or_evict_devices() {
     drop(inner);
     drop(state);
     std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+
+#[test]
+fn authenticated_reconnect_does_not_consume_new_registration_budget() {
+    let l = limits(100, 0.0, 1.0, 1000);
+    let mut inner = Inner::new(1.0);
+    let token = registered_token(inner.register("a", 1, "old".into(), tx(), None, 1000, &l));
+    assert!(matches!(inner.register("a", 2, "bad".into(), tx(), Some("wrong"), 1001, &l), RegisterOutcome::Unauthorized));
+    assert_eq!(registered_token(inner.register("a", 3, "new".into(), tx(), Some(&token), 1002, &l)), token);
+    assert_eq!(inner.devices["a"].conn_id, 3);
+    assert_eq!(inner.devices["a"].payload, "new");
+    assert!(matches!(inner.register("b", 4, "other".into(), tx(), None, 1003, &l), RegisterOutcome::RateLimited));
+}
+
+#[tokio::test]
+async fn unanswered_pings_expire_even_when_the_writer_queue_accepts_them() {
+    let (sender, mut replies) = mpsc::unbounded_channel();
+    let mut stream = futures_util::stream::pending::<Result<Message, ()>>();
+    let mut last_received = tokio::time::Instant::now();
+    let result = tokio::time::timeout(Duration::from_secs(1), receive_ws(
+        &mut stream, &sender, &mut last_received, Duration::from_millis(2), Duration::from_millis(15),
+    )).await.expect("死链必须有界退出");
+    assert_eq!(result.unwrap_err(), "hb_timeout");
+    assert!(matches!(replies.try_recv(), Ok(Message::Ping(_))));
+}
+
+#[tokio::test]
+async fn incoming_pong_refreshes_the_monotonic_deadline() {
+    let (sender, _replies) = mpsc::unbounded_channel();
+    let mut stream = futures_util::stream::iter([Ok::<_, ()>(Message::Pong(Vec::new().into()))]);
+    let mut last_received = tokio::time::Instant::now() - Duration::from_secs(1);
+    let before = tokio::time::Instant::now();
+    assert!(matches!(receive_ws(&mut stream, &sender, &mut last_received, Duration::from_secs(20), Duration::from_secs(60)).await, Ok(Message::Pong(_))));
+    assert!(last_received >= before);
+}
+
+#[tokio::test]
+async fn stopping_a_blocked_writer_drops_its_socket_task() {
+    let (dropped, wait_drop) = tokio::sync::oneshot::channel();
+    struct OnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+    impl Drop for OnDrop { fn drop(&mut self) { let _ = self.0.take().unwrap().send(()); } }
+    let guard = OnDrop(Some(dropped));
+    let writer = tokio::spawn(async move {
+        let _guard = guard;
+        std::future::pending::<()>().await;
+    });
+    tokio::time::timeout(Duration::from_secs(1), stop_writer(writer)).await.expect("写端不能阻塞离线广播和配额释放");
+    wait_drop.await.unwrap();
+}
+
+
+#[test]
+fn old_connection_cleanup_preserves_the_replacement_address() {
+    let l = limits(100, 0.0, 1.0, 1000);
+    let mut inner = Inner::new(1.0);
+    let token = registered_token(inner.register("a", 1, "old".into(), tx(), None, 1000, &l));
+    registered_token(inner.register("a", 2, "new".into(), tx(), Some(&token), 1001, &l));
+    assert_eq!(inner.disconnect_device("a", 1, true), (false, true));
+    assert_eq!(inner.devices["a"].payload, "new");
+    assert_eq!(inner.disconnect_device("a", 2, true), (true, false));
+    assert!(!inner.devices.contains_key("a"));
+}
+
+
+#[tokio::test]
+async fn offline_is_queued_before_replacement_update_while_old_writer_stalls() {
+    let l = limits(100, 0.0, 1.0, 1000);
+    let mut inner = Inner::new(1.0);
+    let token = registered_token(inner.register("a", 1, "old".into(), tx(), None, 1000, &l));
+    let (watcher, mut events) = mpsc::unbounded_channel();
+    inner.watchers.entry("a".into()).or_default().insert(1, watcher);
+    let state = AppState { inner: Arc::new(RwLock::new(inner)), limits: l.clone() };
+    {
+        let mut guard = state.inner.write().await;
+        assert_eq!(guard.disconnect_device("a", 1, true), (true, false));
+    }
+    let writer = tokio::spawn(std::future::pending::<()>());
+    let stopping = tokio::spawn(stop_writer(writer));
+    {
+        let mut guard = state.inner.write().await;
+        registered_token(guard.register("a", 2, "new".into(), tx(), Some(&token), 1001, &l));
+    }
+    broadcast_update(&state, "a", "new").await;
+    stopping.await.unwrap();
+    let event = |message: Message| match message { Message::Text(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap(), _ => panic!("text event") };
+    assert_eq!(event(events.try_recv().expect("断开必须同步排离线"))["type"], "offline");
+    assert_eq!(event(events.try_recv().unwrap())["type"], "update");
+    assert!(events.try_recv().is_err(), "写端收尾不能再发迟到离线");
+    {
+        let mut guard = state.inner.write().await;
+        assert_eq!(guard.disconnect_device("a", 1, true), (false, true));
+    }
+    assert!(events.try_recv().is_err(), "旧连接不能为新记录发offline");
+    assert_eq!(snapshot(&state, "a").await, (true, Some("new".into())));
 }

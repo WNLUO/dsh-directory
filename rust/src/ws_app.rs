@@ -1,4 +1,4 @@
-//! APP 侧长连接（`/ws/app`）。
+//! APP 侧长连接（`/ws/app`）。 入站静默超时回收且不等待阻塞写端。
 //!
 //! APP 拿着插件转交的令牌连上来，可以查一次（`query`），也可以订阅（`watch`）——
 //! 订阅后先给一份当前快照，之后只在载荷变化 / 设备掉线时才收到推送，平时一个字都不发。
@@ -18,6 +18,7 @@ use serde::Deserialize;
 use crate::model::{AppIn, AppOut};
 use crate::state::{
     client_ip, ip_acquire, ip_has_room, ip_release, now_secs, snapshot, AppState, Tx,
+    receive_ws, stop_writer, WS_IDLE_TIMEOUT, WS_PING_INTERVAL,
 };
 
 #[derive(Debug, Deserialize)]
@@ -58,9 +59,8 @@ async fn handle(socket: WebSocket, state: AppState, instance_id: String, ip: Str
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
     let writer = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            if sink.send(msg).await.is_err() {
-                break;
-            }
+            let closing = matches!(&msg, Message::Close(_));
+            if sink.send(msg).await.is_err() || closing { break; }
         }
     });
 
@@ -71,17 +71,11 @@ async fn handle(socket: WebSocket, state: AppState, instance_id: String, ip: Str
     };
     let mut watching = false;
 
-    // 与设备侧一致：订阅后平时没有数据，靠定时 Ping 顶住 CDN 的空闲回收，避免无谓重连。
+    let mut last_received = tokio::time::Instant::now();
     loop {
-        let msg = match tokio::time::timeout(std::time::Duration::from_secs(20), stream.next()).await {
-            Ok(Some(Ok(m))) => m,
-            Ok(Some(Err(_))) | Ok(None) => break,
-            Err(_) => {
-                if tx.send(Message::Ping(Vec::new().into())).is_err() {
-                    break;
-                }
-                continue;
-            }
+        let msg = match receive_ws(&mut stream, &tx, &mut last_received, WS_PING_INTERVAL, WS_IDLE_TIMEOUT).await {
+            Ok(message) => message,
+            Err(_) => break,
         };
         let text = match msg {
             Message::Text(t) => t.to_string(),
@@ -145,7 +139,7 @@ async fn handle(socket: WebSocket, state: AppState, instance_id: String, ip: Str
         }
     }
     drop(tx);
-    let _ = writer.await;
+    stop_writer(writer).await;
     ip_release(&state, &ip).await;
 }
 
