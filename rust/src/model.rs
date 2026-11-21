@@ -17,6 +17,8 @@ pub enum DeviceIn {
     Register { payload: String },
     /// 载荷变化时上报新的整份加密载荷（不是增量）。
     Update { payload: String },
+    /// 回应 APP 的「自检」：一份密文答案（信封 JSON），总控不解析。
+    Answer { payload: String },
 }
 
 /// 总控 → 设备。
@@ -27,6 +29,8 @@ pub enum DeviceOut {
     Registered { instance_id: String, token: String },
     /// 一次更新已被收下。
     Updated,
+    /// 有 APP 请这台设备做一次自检。**不带任何内容**：总控不告诉设备是谁问的，也不需要。
+    Ask,
     Error { message: String },
 }
 
@@ -40,6 +44,9 @@ pub enum AppIn {
     Watch,
     /// 取消订阅。
     Unwatch,
+    /// 请这台设备做一次自检。总控只负责转达：不记录是谁问的，也不指定答案给谁
+    /// （答案只回到这一条连接上，见 `ws_app`）。
+    Ask,
 }
 
 /// 总控 → APP。
@@ -59,5 +66,14 @@ pub enum AppOut {
     },
     /// 订阅期间设备断开。
     Offline { instance_id: String },
+    /// 已把这句「请自检」交到设备那条连接上（设备还没回）。
+    ///
+    /// 单独回这一句，是为了让手机分得清「总控没收到」和「电脑没回话」—— 后者多半是插件
+    /// 版本太旧（还不认识这条消息），说成手机网络问题会让人查错方向。
+    Asked { instance_id: String },
+    /// 设备回的自检结果（密文，APP 自己解）。
+    Diagnosis { instance_id: String, payload: String },
+    /// 这次自检没能转达：设备此刻不在总控上（插件没跑 / 电脑没出网 / 没开自动上报）。
+    DiagnosisUnavailable { instance_id: String, reason: String },
     Error { message: String },
 }

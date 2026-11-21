@@ -14,7 +14,7 @@ use axum::{extract::ws::Message, http::HeaderMap};
 use tokio::sync::{mpsc, RwLock};
 use futures_util::{Stream, StreamExt};
 
-use crate::model::AppOut;
+use crate::model::{AppOut, DeviceOut};
 use crate::token_store::{TokenEntry, TokenStore};
 
 /// 一条连接的出站通道。写线程独占 socket 的写端，其它地方往这里丢消息。
@@ -138,6 +138,13 @@ pub struct DeviceEntry {
     pub control: Tx,
 }
 
+/// 一位正在等自检结果的 APP：那条连接的出站通道，以及它在自己连接内的编号
+/// （断开时按编号摘，别把下一位的等待位误删）。
+pub struct DiagnoseWaiter {
+    pub id: u64,
+    pub tx: Tx,
+}
+
 /// 一次注册的处理结果。
 pub enum RegisterOutcome {
     Ok {
@@ -163,6 +170,9 @@ pub struct Inner {
     pub tokens: HashMap<String, TokenEntry>,
     /// 订阅者：instanceId → (订阅 id → 出站通道)。
     pub watchers: HashMap<String, HashMap<u64, Tx>>,
+    /// 正在等自检结果的 APP：instanceId → 那一条连接。只留一位 —— 同一台设备同一时刻
+    /// 只会有一个「自检」在跑，后问的顶掉先问的（先问的那条自己会超时）。
+    pub diagnose_waiters: HashMap<String, DiagnoseWaiter>,
     /// 每个来源 IP 当前的连接数。
     pub ip_conns: HashMap<String, u32>,
     pub next_conn: u64,
@@ -177,6 +187,7 @@ impl Inner {
             devices: HashMap::new(),
             tokens: HashMap::new(),
             watchers: HashMap::new(),
+            diagnose_waiters: HashMap::new(),
             ip_conns: HashMap::new(),
             next_conn: 0,
             next_watcher: 0,
@@ -192,6 +203,16 @@ impl Inner {
         if owned {
             self.devices.remove(instance_id);
             self.broadcast_device(instance_id, AppOut::Offline { instance_id: instance_id.to_string() });
+            // 还在等自检的那一位别干等到超时：设备这条腿断了，答案已经不可能回来。
+            if let Some(waiter) = self.diagnose_waiters.remove(instance_id) {
+                let event = AppOut::DiagnosisUnavailable {
+                    instance_id: instance_id.to_string(),
+                    reason: "device_offline".to_string(),
+                };
+                if let Ok(text) = serde_json::to_string(&event) {
+                    let _ = waiter.tx.send(Message::Text(text.into()));
+                }
+            }
         }
         (owned, registered && current.is_some() && current != Some(conn_id))
     }
@@ -201,6 +222,56 @@ impl Inner {
         let Ok(payload) = serde_json::to_string(&event) else { return };
         if let Some(watchers) = self.watchers.get(instance_id) {
             for sender in watchers.values() { let _ = sender.send(Message::Text(payload.clone().into())); }
+        }
+    }
+
+    /// 把「请自检」转给这台设备此刻那条连接，并记住问话的那一位。
+    ///
+    /// 设备不在总控上（没连、或那条连接的写端已经没了）返回 false，调用方据此当场回
+    /// `diagnosis_unavailable`，别让手机干等一次超时。
+    pub fn ask_device(&mut self, instance_id: &str, asker_id: u64, asker: Tx) -> bool {
+        let ask = match serde_json::to_string(&DeviceOut::Ask) {
+            Ok(text) => text,
+            Err(_) => return false,
+        };
+        let Some(entry) = self.devices.get_mut(instance_id) else {
+            return false;
+        };
+        if entry.control.send(Message::Text(ask.into())).is_err() {
+            return false;
+        }
+        self.diagnose_waiters.insert(
+            instance_id.to_string(),
+            DiagnoseWaiter { id: asker_id, tx: asker },
+        );
+        true
+    }
+
+    /// 设备回了自检结果：只交给当前这条设备连接登记的那位等待者，并把等待位清掉。
+    ///
+    /// 已经没人等（APP 关掉了弹窗 / 换了另一台）就丢掉这份答案，不回错 —— 设备那边
+    /// 没有理由为「对方走了」重发。
+    pub fn answer_diagnosis(&mut self, instance_id: &str, conn_id: u64, payload: String) -> bool {
+        if self.devices.get(instance_id).map(|device| device.conn_id) != Some(conn_id) {
+            return false;
+        }
+        let Some(waiter) = self.diagnose_waiters.remove(instance_id) else {
+            return false;
+        };
+        let event = AppOut::Diagnosis {
+            instance_id: instance_id.to_string(),
+            payload,
+        };
+        match serde_json::to_string(&event) {
+            Ok(text) => waiter.tx.send(Message::Text(text.into())).is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    /// APP 那条连接断了：它要是还在等结果，把等待位摘掉。
+    pub fn drop_diagnose_waiter(&mut self, instance_id: &str, asker_id: u64) {
+        if self.diagnose_waiters.get(instance_id).map(|waiter| waiter.id) == Some(asker_id) {
+            self.diagnose_waiters.remove(instance_id);
         }
     }
 

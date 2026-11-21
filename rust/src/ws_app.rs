@@ -70,6 +70,8 @@ async fn handle(socket: WebSocket, state: AppState, instance_id: String, ip: Str
         g.next_watcher
     };
     let mut watching = false;
+    // 这一条连接此刻有没有在等自检结果（有就在断开时把等待位摘掉）。
+    let mut awaiting_diagnosis: Option<u64> = None;
 
     let mut last_received = tokio::time::Instant::now();
     loop {
@@ -123,6 +125,29 @@ async fn handle(socket: WebSocket, state: AppState, instance_id: String, ip: Str
                     watching = false;
                 }
             }
+            Ok(AppIn::Ask) => {
+                // 转达一次「请自检」：设备不在总控上就当场回一句 unavailable，
+                // 让手机立刻能说「电脑那边没连上」，而不是干等超时。
+                let (asker_id, delivered) = {
+                    let mut g = state.inner.write().await;
+                    g.next_watcher += 1;
+                    let asker_id = g.next_watcher;
+                    let delivered = g.ask_device(&instance_id, asker_id, tx.clone());
+                    (asker_id, delivered)
+                };
+                if delivered {
+                    awaiting_diagnosis = Some(asker_id);
+                    send_json(&tx, &AppOut::Asked { instance_id: instance_id.clone() });
+                } else {
+                    send_json(
+                        &tx,
+                        &AppOut::DiagnosisUnavailable {
+                            instance_id: instance_id.clone(),
+                            reason: "device_offline".into(),
+                        },
+                    );
+                }
+            }
             Err(_) => {
                 send_json(&tx, &AppOut::Error { message: "bad message".into() });
             }
@@ -137,6 +162,10 @@ async fn handle(socket: WebSocket, state: AppState, instance_id: String, ip: Str
                 g.watchers.remove(&instance_id);
             }
         }
+    }
+    if let Some(asker_id) = awaiting_diagnosis {
+        let mut g = state.inner.write().await;
+        g.drop_diagnose_waiter(&instance_id, asker_id);
     }
     drop(tx);
     stop_writer(writer).await;

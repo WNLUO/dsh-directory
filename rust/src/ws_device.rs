@@ -197,6 +197,22 @@ async fn handle(
                     send_json(&tx, &DeviceOut::Error { message: "send register first".into() });
                 }
             }
+            Ok(DeviceIn::Answer { payload }) => {
+                if !registered {
+                    send_json(&tx, &DeviceOut::Error { message: "send register first".into() });
+                    continue;
+                }
+                if payload.len() > MAX_PAYLOAD_BYTES {
+                    send_json(&tx, &DeviceOut::Error { message: "payload too large".into() });
+                    continue;
+                }
+                // 只转给此刻在等这份答案的那一条 APP 连接；没人等就丢掉（对方关了弹窗）。
+                // 不回执：设备侧没有「对方收到没有」可做，重发一份也没有意义。
+                let _ = {
+                    let mut g = state.inner.write().await;
+                    g.answer_diagnosis(&instance_id, conn_id, payload)
+                };
+            }
             Err(_) => {
                 send_json(&tx, &DeviceOut::Error { message: "bad message".into() });
             }

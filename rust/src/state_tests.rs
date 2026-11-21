@@ -348,3 +348,83 @@ async fn offline_is_queued_before_replacement_update_while_old_writer_stalls() {
     assert!(events.try_recv().is_err(), "旧连接不能为新记录发offline");
     assert_eq!(snapshot(&state, "a").await, (true, Some("new".into())));
 }
+
+fn text_event(message: Message) -> serde_json::Value {
+    match message {
+        Message::Text(text) => serde_json::from_str(&text).unwrap(),
+        _ => panic!("text event"),
+    }
+}
+
+fn channel() -> (Tx, mpsc::UnboundedReceiver<Message>) {
+    mpsc::unbounded_channel()
+}
+
+#[test]
+fn ask_without_an_online_device_is_refused() {
+    let mut inner = Inner::new(1000.0);
+    let (asker, _asker_rx) = channel();
+    assert!(!inner.ask_device("a", 1, asker));
+    assert!(inner.diagnose_waiters.is_empty());
+}
+
+#[test]
+fn answer_reaches_only_the_waiter_of_that_connection() {
+    let l = limits(10, 1000.0, 1000.0, 1000);
+    let mut inner = Inner::new(1000.0);
+    let (device, mut device_rx) = channel();
+    assert!(matches!(
+        inner.register("a", 7, "pa".into(), device, None, 1000, &l),
+        RegisterOutcome::Ok { .. }
+    ));
+    let (asker, mut asker_rx) = channel();
+    assert!(inner.ask_device("a", 11, asker));
+    assert_eq!(text_event(device_rx.try_recv().expect("设备要收到 ask"))["type"], "ask");
+
+    // 旧连接（换了号的那条）回话不算数，等待位不动。
+    assert!(!inner.answer_diagnosis("a", 8, "stale".into()));
+    assert!(inner.diagnose_waiters.contains_key("a"));
+    assert!(asker_rx.try_recv().is_err());
+
+    assert!(inner.answer_diagnosis("a", 7, "sealed".into()));
+    let answer = text_event(asker_rx.try_recv().expect("APP 要收到 diagnosis"));
+    assert_eq!(answer["type"], "diagnosis");
+    assert_eq!(answer["payload"], "sealed");
+    assert!(inner.diagnose_waiters.is_empty());
+    assert!(!inner.answer_diagnosis("a", 7, "again".into()));
+}
+
+#[test]
+fn device_going_offline_tells_the_waiting_app() {
+    let l = limits(10, 1000.0, 1000.0, 1000);
+    let mut inner = Inner::new(1000.0);
+    let (device, _device_rx) = channel();
+    assert!(matches!(
+        inner.register("a", 7, "pa".into(), device, None, 1000, &l),
+        RegisterOutcome::Ok { .. }
+    ));
+    let (asker, mut asker_rx) = channel();
+    assert!(inner.ask_device("a", 11, asker));
+    assert_eq!(inner.disconnect_device("a", 7, true), (true, false));
+    let event = text_event(asker_rx.try_recv().expect("等结果的那位要被告知"));
+    assert_eq!(event["type"], "diagnosis_unavailable");
+    assert_eq!(event["reason"], "device_offline");
+    assert!(inner.diagnose_waiters.is_empty());
+}
+
+#[test]
+fn closing_the_asking_connection_clears_only_its_own_slot() {
+    let l = limits(10, 1000.0, 1000.0, 1000);
+    let mut inner = Inner::new(1000.0);
+    let (device, _device_rx) = channel();
+    assert!(matches!(
+        inner.register("a", 7, "pa".into(), device, None, 1000, &l),
+        RegisterOutcome::Ok { .. }
+    ));
+    let (asker, _asker_rx) = channel();
+    assert!(inner.ask_device("a", 11, asker));
+    inner.drop_diagnose_waiter("a", 12);
+    assert!(inner.diagnose_waiters.contains_key("a"));
+    inner.drop_diagnose_waiter("a", 11);
+    assert!(inner.diagnose_waiters.is_empty());
+}
