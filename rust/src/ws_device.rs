@@ -1,5 +1,7 @@
 //! 设备侧长连接：注册令牌持久成功后才回执并发布在线地址。 入站静默超时回收且不等待阻塞写端。
 //!
+//! 未授权注册按来源 IP 限流：额度耗尽后，同一 IP 的握手在升级前就被 429，不进注册流程。
+//!
 //! 设备（插件宿主）主动连上来，报 `instanceId` 与一份**加密载荷**（全部连接地址封在里面，
 //! 总控不解析）；连接一断，这台就算离线，订阅它的 APP 会收到一条离线事件。载荷没变化时
 //! 这里不发任何主动消息，链路保持静默。
@@ -18,7 +20,8 @@ use serde::Deserialize;
 use crate::model::{DeviceIn, DeviceOut, MAX_PAYLOAD_BYTES};
 use crate::state::{
     broadcast_update, client_ip, ip_acquire, ip_has_room, ip_release, now_secs,
-    AppState, RegisterOutcome, Tx, receive_ws, stop_writer, WS_IDLE_TIMEOUT, WS_PING_INTERVAL,
+    record_reg_fail, reg_fail_throttled, AppState, RegisterOutcome, Tx, receive_ws, stop_writer,
+    WS_IDLE_TIMEOUT, WS_PING_INTERVAL,
 };
 
 #[derive(Debug, Deserialize)]
@@ -37,6 +40,10 @@ pub async fn handler(
     Query(query): Query<DeviceQuery>,
 ) -> Response {
     let ip = client_ip(&headers);
+    // 未授权注册刷太多次的 IP 先在握手阶段挡掉，省得每次都建连接再断。
+    if reg_fail_throttled(&state, &ip).await {
+        return (StatusCode::TOO_MANY_REQUESTS, "too many failed registrations").into_response();
+    }
     if !ip_has_room(&state, &ip).await {
         return (StatusCode::TOO_MANY_REQUESTS, "too many connections").into_response();
     }
@@ -155,6 +162,8 @@ async fn handle(
                         break;
                     }
                     RegisterOutcome::Unauthorized => {
+                        // 扣该 IP 一次未授权额度；连续刷到额度耗尽，后续握手直接被 429。
+                        record_reg_fail(&state, &ip).await;
                         eprintln!(
                             "diag register id={} ip={} outcome=unauthorized token={}",
                             instance_id,

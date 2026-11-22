@@ -39,6 +39,8 @@ cargo run --release
 | `MAX_CONNS_PER_IP` | 单来源 IP 的并发连接上限 | `50` |
 | `REG_RATE_PER_SEC` | 全局新注册速率（每秒） | `500` |
 | `REG_RATE_BURST` | 全局注册突发上限 | `1000` |
+| `REG_FAIL_BURST` | 单 IP 未授权注册的突发次数额度 | `5` |
+| `REG_FAIL_REFILL_SECS` | 额度用尽后，单 IP 每隔多少秒恢复一次尝试机会 | `300` |
 
 健康检查：`GET /healthz` → `{"ok":true,"devices":N,"watchers":M}`。
 
@@ -135,6 +137,11 @@ APP  → 总控   { "type": "ask" }
 - **全局注册限速**：新注册走令牌桶（`REG_RATE_PER_SEC` / `REG_RATE_BURST`），CC 洪峰时快速拒绝。
 - **每 IP 并发上限**：单来源 IP 最多 `MAX_CONNS_PER_IP` 条连接，超了直接 429。真实 IP 从代理头
   （`X-Forwarded-For` / `X-Real-IP`）取；流量过 CDN，这一条只是粗挡。
+- **未授权注册按 IP 限流**：只有「令牌不符 / 缺令牌」这类鉴权失败才计数，成功注册不扣。单 IP
+  允许 `REG_FAIL_BURST` 次突发失败，用尽后每 `REG_FAIL_REFILL_SECS` 秒才恢复一次尝试机会；额度
+  耗尽时该 IP 的设备握手在升级前直接 429（不发令牌、不建长连接）。用于压制单个 IP 反复猜令牌或
+  重放已登记 instanceId 的刷量，正常设备几乎无感。同 IP 多设备共用出口（如运营商大内网）时这层
+  只是粗挡，额度留有余量。
 
 ## 设计取舍
 

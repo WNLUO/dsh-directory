@@ -32,6 +32,19 @@ async fn main() {
         }
     };
 
+    // 定期清理长期无活动的「未授权注册失败」IP 额度桶，防止被轮换 IP 撑大内存。
+    {
+        let sweep_state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
+            loop {
+                tick.tick().await;
+                let mut guard = sweep_state.inner.write().await;
+                guard.sweep_reg_fails(&sweep_state.limits, std::time::Instant::now());
+            }
+        });
+    }
+
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/ws/device", get(ws_device::handler))

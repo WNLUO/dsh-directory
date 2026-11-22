@@ -9,6 +9,8 @@ fn limits(max_devices: usize, reg_per_sec: f64, reg_burst: f64, max_tokens: usiz
         max_conns_per_ip: 50,
         reg_per_sec,
         reg_burst,
+        reg_fail_burst: 5.0,
+        reg_fail_refill_secs: 300.0,
     }
 }
 
@@ -427,4 +429,63 @@ fn closing_the_asking_connection_clears_only_its_own_slot() {
     assert!(inner.diagnose_waiters.contains_key("a"));
     inner.drop_diagnose_waiter("a", 11);
     assert!(inner.diagnose_waiters.is_empty());
+}
+
+#[test]
+fn unauthorized_registration_throttles_after_burst() {
+    let l = limits(100, 1000.0, 1000.0, 1000);
+    let mut inner = Inner::new(1000.0);
+    let ip = "1.2.3.4";
+    let now = Instant::now();
+    assert!(!inner.reg_fail_throttled(ip, &l, now), "没有失败记录就不拦");
+    for i in 0..4 {
+        inner.record_reg_fail(ip, &l, now);
+        assert!(
+            !inner.reg_fail_throttled(ip, &l, now),
+            "第 {} 次失败仍在额度内",
+            i + 1
+        );
+    }
+    inner.record_reg_fail(ip, &l, now); // 第 5 次把突发额度用尽
+    assert!(inner.reg_fail_throttled(ip, &l, now), "额度用尽后同一 IP 应被限流");
+}
+
+#[test]
+fn reg_fail_budget_recovers_after_interval() {
+    let l = limits(100, 1000.0, 1000.0, 1000);
+    let mut inner = Inner::new(1000.0);
+    let ip = "5.6.7.8";
+    let t0 = Instant::now();
+    for _ in 0..5 {
+        inner.record_reg_fail(ip, &l, t0);
+    }
+    assert!(inner.reg_fail_throttled(ip, &l, t0));
+    // 过一个恢复间隔，应重新攒够一次机会。
+    let later = t0 + Duration::from_secs(300);
+    assert!(!inner.reg_fail_throttled(ip, &l, later), "过了恢复间隔应放行一次");
+}
+
+#[test]
+fn reg_fail_budget_is_per_ip() {
+    let l = limits(100, 1000.0, 1000.0, 1000);
+    let mut inner = Inner::new(1000.0);
+    let t0 = Instant::now();
+    for _ in 0..5 {
+        inner.record_reg_fail("9.9.9.9", &l, t0);
+    }
+    assert!(inner.reg_fail_throttled("9.9.9.9", &l, t0));
+    assert!(!inner.reg_fail_throttled("8.8.8.8", &l, t0), "别的 IP 不受影响");
+}
+
+#[test]
+fn idle_reg_fail_buckets_are_swept() {
+    let l = limits(100, 1000.0, 1000.0, 1000);
+    let mut inner = Inner::new(1000.0);
+    let t0 = Instant::now();
+    inner.record_reg_fail("7.7.7.7", &l, t0);
+    assert_eq!(inner.fail_buckets.len(), 1);
+    let much_later =
+        t0 + Duration::from_secs_f64(l.reg_fail_refill_secs * l.reg_fail_burst + 601.0);
+    inner.sweep_reg_fails(&l, much_later);
+    assert!(inner.fail_buckets.is_empty(), "长期无活动的失败桶应被清理");
 }

@@ -1,6 +1,8 @@
 //! 目录状态与注册鉴权：有效令牌重连不占新注册配额，静默死链按单调期限回收。
 //!
 //! 设备记录是不透明密文；重启后等待设备重新上报，不恢复过期的在线地址。
+//! 未授权注册（令牌不符 / 缺令牌）按来源 IP 限流：少量突发后长时间才放行一次，
+//! 抑制单个 IP 反复猜令牌或重放已登记的 instanceId。
 
 use std::{
     collections::HashMap,
@@ -67,6 +69,10 @@ pub struct Limits {
     /// 全局新注册速率（每秒令牌数）与突发上限，用于挡住 CC 洪峰。
     pub reg_per_sec: f64,
     pub reg_burst: f64,
+    /// 单个来源 IP 的未授权注册失败额度（突发次数）与恢复间隔（秒）。
+    /// 额度用尽后，该 IP 每 `reg_fail_refill_secs` 秒才恢复一次尝试机会。
+    pub reg_fail_burst: f64,
+    pub reg_fail_refill_secs: f64,
 }
 
 impl Limits {
@@ -95,6 +101,8 @@ impl Limits {
             max_conns_per_ip: u32v("MAX_CONNS_PER_IP", 50),
             reg_per_sec: f64v("REG_RATE_PER_SEC", 500.0),
             reg_burst: f64v("REG_RATE_BURST", 1000.0),
+            reg_fail_burst: f64v("REG_FAIL_BURST", 5.0),
+            reg_fail_refill_secs: f64v("REG_FAIL_REFILL_SECS", 300.0),
         }
     }
 }
@@ -114,15 +122,28 @@ impl RateBucket {
     }
 
     fn try_take(&mut self, per_sec: f64, burst: f64, now: Instant) -> bool {
-        let dt = now.duration_since(self.last).as_secs_f64().max(0.0);
-        self.tokens = (self.tokens + dt * per_sec).min(burst);
-        self.last = now;
+        self.refill(per_sec, burst, now);
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
             true
         } else {
             false
         }
+    }
+
+    /// 只按经过的时间补令牌到上限，不消耗。用于「当前是否够一次」的只读判定。
+    fn refill(&mut self, per_sec: f64, burst: f64, now: Instant) {
+        let dt = now.duration_since(self.last).as_secs_f64().max(0.0);
+        self.tokens = (self.tokens + dt * per_sec).min(burst);
+        self.last = now;
+    }
+}
+
+fn refill_per_sec(limits: &Limits) -> f64 {
+    if limits.reg_fail_refill_secs > 0.0 {
+        1.0 / limits.reg_fail_refill_secs
+    } else {
+        0.0
     }
 }
 
@@ -178,6 +199,8 @@ pub struct Inner {
     pub next_conn: u64,
     pub next_watcher: u64,
     reg_bucket: RateBucket,
+    /// 每个来源 IP 的未授权注册失败额度桶。只有鉴权失败才扣，成功注册不扣。
+    fail_buckets: HashMap<String, RateBucket>,
     token_store: Option<TokenStore>,
 }
 
@@ -192,6 +215,7 @@ impl Inner {
             next_conn: 0,
             next_watcher: 0,
             reg_bucket: RateBucket::new(burst),
+            fail_buckets: HashMap::new(),
             token_store: None,
         }
     }
@@ -294,6 +318,47 @@ impl Inner {
             .take(remove)
             .map(|(id, _)| id.to_string())
             .collect()
+    }
+
+    /// 这个来源 IP 的未授权注册额度是否已耗尽（耗尽 = 当前应直接拒，先别握手）。
+    ///
+    /// 只读判定：按经过时间把令牌补满到上限后再看够不够一次；没有失败记录就不拦。
+    pub fn reg_fail_throttled(&self, ip: &str, limits: &Limits, now: Instant) -> bool {
+        let per_sec = refill_per_sec(limits);
+        let burst = limits.reg_fail_burst.max(1.0);
+        match self.fail_buckets.get(ip) {
+            Some(bucket) => {
+                let dt = now.duration_since(bucket.last).as_secs_f64().max(0.0);
+                let projected = (bucket.tokens + dt * per_sec).min(burst);
+                projected < 1.0
+            }
+            None => false,
+        }
+    }
+
+    /// 记一次未授权注册失败：扣掉该 IP 一次额度。额度已空也保持为空，靠时间慢慢恢复。
+    pub fn record_reg_fail(&mut self, ip: &str, limits: &Limits, now: Instant) {
+        let per_sec = refill_per_sec(limits);
+        let burst = limits.reg_fail_burst.max(1.0);
+        let bucket = self
+            .fail_buckets
+            .entry(ip.to_string())
+            .or_insert_with(|| RateBucket::new(burst));
+        let _ = bucket.try_take(per_sec, burst, now);
+    }
+
+    /// 定期清理已长期无活动的失败桶，避免被轮换 IP 撑大内存。
+    pub fn sweep_reg_fails(&mut self, limits: &Limits, now: Instant) {
+        let per_sec = refill_per_sec(limits);
+        if per_sec <= 0.0 {
+            self.fail_buckets.clear();
+            return;
+        }
+        // 从空额度恢复满需要的时长 + 10 分钟缓冲；超过这个时间没再失败就清掉。
+        let keep_idle =
+            Duration::from_secs_f64(limits.reg_fail_burst.max(1.0) / per_sec + 600.0);
+        self.fail_buckets
+            .retain(|_, bucket| now.duration_since(bucket.last) < keep_idle);
     }
 
     /// 收下一次设备注册：校验令牌 → 新身份限速 → 容量与持久化 → 发布在线记录。
@@ -442,6 +507,18 @@ pub async fn ip_release(state: &AppState, ip: &str) {
     if empty {
         g.ip_conns.remove(ip);
     }
+}
+
+/// 这个来源 IP 的未授权注册额度是否已耗尽（耗尽则该次握手直接 429）。
+pub async fn reg_fail_throttled(state: &AppState, ip: &str) -> bool {
+    let g = state.inner.read().await;
+    g.reg_fail_throttled(ip, &state.limits, Instant::now())
+}
+
+/// 记一次未授权注册失败，扣该 IP 一次额度。
+pub async fn record_reg_fail(state: &AppState, ip: &str) {
+    let mut g = state.inner.write().await;
+    g.record_reg_fail(ip, &state.limits, Instant::now());
 }
 
 /// 把这台设备当前的密文载荷读出来，顺便刷新「被 APP 关注」的时间。
