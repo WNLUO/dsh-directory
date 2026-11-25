@@ -17,6 +17,8 @@ use tokio::sync::{mpsc, RwLock};
 use futures_util::{Stream, StreamExt};
 
 use crate::model::{AppOut, DeviceOut};
+use crate::push::should_send;
+use crate::push_store::{PushEntry, PushKey, PushStore};
 use crate::token_store::{TokenEntry, TokenStore};
 
 /// 一条连接的出站通道。写线程独占 socket 的写端，其它地方往这里丢消息。
@@ -64,6 +66,8 @@ pub struct Limits {
     pub max_devices: usize,
     /// 每台设备的令牌记录上限。到线后淘汰最久没来注册的（挡住「不停换 instanceId」把内存吃满）。
     pub max_tokens: usize,
+    /// 推送令牌记录上限（一台电脑可以被多台手机登记）。到线后淘汰最久没更新的。
+    pub max_push_tokens: usize,
     /// 单个来源 IP 的并发连接上限（含设备与 APP）。
     pub max_conns_per_ip: u32,
     /// 全局新注册速率（每秒令牌数）与突发上限，用于挡住 CC 洪峰。
@@ -98,6 +102,7 @@ impl Limits {
         Self {
             max_devices: usizev("MAX_DEVICES", 100_000),
             max_tokens: usizev("MAX_TOKENS", 200_000),
+            max_push_tokens: usizev("MAX_PUSH_TOKENS", 200_000),
             max_conns_per_ip: u32v("MAX_CONNS_PER_IP", 50),
             reg_per_sec: f64v("REG_RATE_PER_SEC", 500.0),
             reg_burst: f64v("REG_RATE_BURST", 1000.0),
@@ -189,6 +194,9 @@ pub struct Inner {
     /// 每台设备的令牌。**故意不随设备断开而删除**：设备重连要拿回同一个令牌，APP 手里的
     /// 才不会失效。超上限时按最久未注册淘汰。
     pub tokens: HashMap<String, TokenEntry>,
+    /// 推送令牌：(instanceId, deviceId) → 那台手机的 APNs 令牌。与设备令牌一样不随断线删除，
+    /// 手机重装 / 换机时被新令牌覆盖，苹果说它失效时摘掉。
+    pub push_tokens: HashMap<PushKey, PushEntry>,
     /// 订阅者：instanceId → (订阅 id → 出站通道)。
     pub watchers: HashMap<String, HashMap<u64, Tx>>,
     /// 正在等自检结果的 APP：instanceId → 那一条连接。只留一位 —— 同一台设备同一时刻
@@ -201,7 +209,10 @@ pub struct Inner {
     reg_bucket: RateBucket,
     /// 每个来源 IP 的未授权注册失败额度桶。只有鉴权失败才扣，成功注册不扣。
     fail_buckets: HashMap<String, RateBucket>,
+    /// 每台设备的推送发送速率桶（键是 instanceId）。
+    push_buckets: HashMap<String, RateBucket>,
     token_store: Option<TokenStore>,
+    push_store: Option<PushStore>,
 }
 
 impl Inner {
@@ -209,6 +220,7 @@ impl Inner {
         Self {
             devices: HashMap::new(),
             tokens: HashMap::new(),
+            push_tokens: HashMap::new(),
             watchers: HashMap::new(),
             diagnose_waiters: HashMap::new(),
             ip_conns: HashMap::new(),
@@ -216,7 +228,9 @@ impl Inner {
             next_watcher: 0,
             reg_bucket: RateBucket::new(burst),
             fail_buckets: HashMap::new(),
+            push_buckets: HashMap::new(),
             token_store: None,
+            push_store: None,
         }
     }
 
@@ -320,8 +334,139 @@ impl Inner {
             .collect()
     }
 
-    /// 这个来源 IP 的未授权注册额度是否已耗尽（耗尽 = 当前应直接拒，先别握手）。
-    ///
+    /// 这枚令牌是不是这台设备的。查询地址、上报推送令牌、发推送共用这一条判据。
+    pub fn verify_instance_token(&self, instance_id: &str, token: &str) -> bool {
+        self.tokens
+            .get(instance_id)
+            .map(|entry| entry.token == token)
+            .unwrap_or(false)
+    }
+
+    /// 登记 / 覆盖一台手机的推送令牌；先落盘再对外承诺已登记。
+    pub fn upsert_push_token(
+        &mut self,
+        instance_id: &str,
+        device_id: &str,
+        entry: PushEntry,
+        limits: &Limits,
+    ) -> io::Result<()> {
+        let removed = self.push_victims(instance_id, device_id, limits.max_push_tokens);
+        if let Some(store) = &mut self.push_store {
+            store.record(instance_id, device_id, &entry, removed.clone())?;
+        }
+        for key in &removed {
+            self.push_tokens.remove(key);
+        }
+        self.push_tokens
+            .insert((instance_id.to_string(), device_id.to_string()), entry);
+        if let Some(store) = &mut self.push_store {
+            if let Err(error) = store.compact_if_needed(&self.push_tokens) {
+                eprintln!("push store: compaction failed: {error}");
+            }
+        }
+        Ok(())
+    }
+
+    /// 这台实例要推给哪些手机。`device_id` 空 = 全部已登记设备。
+    pub fn push_targets_of(&self, instance_id: &str, device_id: &str) -> Vec<(String, PushEntry)> {
+        self.push_tokens
+            .iter()
+            .filter(|((instance, device), _)| {
+                instance.as_str() == instance_id && should_send(device, device_id)
+            })
+            .map(|((_, device), entry)| (device.clone(), entry.clone()))
+            .collect()
+    }
+
+    /// 苹果认了另一头环境：把这条记录改记成那个环境（只改登记时那一枚）。
+    pub fn set_push_env(
+        &mut self,
+        instance_id: &str,
+        device_id: &str,
+        token: &str,
+        env: &str,
+        limits: &Limits,
+    ) -> io::Result<()> {
+        let key = (instance_id.to_string(), device_id.to_string());
+        let Some(existing) = self.push_tokens.get(&key).cloned() else {
+            return Ok(());
+        };
+        // 这期间手机换了令牌：旧结论作废，别把新令牌的环境改错。
+        if existing.token != token {
+            return Ok(());
+        }
+        let next = PushEntry {
+            env: env.to_string(),
+            updated_at: now_secs(),
+            ..existing
+        };
+        self.upsert_push_token(instance_id, device_id, next, limits)
+    }
+
+    /// 苹果说这条令牌没了：按值删，只删登记时那一枚，别把期间新上报的删掉。
+    pub fn delete_push_token_if_matches(
+        &mut self,
+        instance_id: &str,
+        device_id: &str,
+        token: &str,
+    ) {
+        let key = (instance_id.to_string(), device_id.to_string());
+        let matched = self
+            .push_tokens
+            .get(&key)
+            .map(|entry| entry.token == token)
+            .unwrap_or(false);
+        if !matched {
+            return;
+        }
+        if let Some(store) = &mut self.push_store {
+            if let Err(error) = store.record_removal(instance_id, device_id) {
+                eprintln!("push store: removal write failed: {error}");
+                return;
+            }
+        }
+        self.push_tokens.remove(&key);
+    }
+
+    /// 这台实例这一发推送能不能发（每实例一分钟 60 条、突发 20 条）。
+    pub fn push_allowed(&mut self, instance_id: &str) -> bool {
+        let bucket = self
+            .push_buckets
+            .entry(instance_id.to_string())
+            .or_insert_with(|| RateBucket::new(crate::push::PUSH_BURST));
+        bucket.try_take(crate::push::PUSH_PER_SEC, crate::push::PUSH_BURST, Instant::now())
+    }
+
+    /// 长期没发过推送的桶清掉，别让它随实例数涨内存。
+    pub fn sweep_push_buckets(&mut self, keep_idle: Duration) {
+        let now = Instant::now();
+        self.push_buckets
+            .retain(|_, bucket| now.duration_since(bucket.last) < keep_idle);
+    }
+
+    /// 返回本次登记后需要淘汰的推送令牌（最久没更新的先走）。
+    fn push_victims(&self, instance_id: &str, device_id: &str, max: usize) -> Vec<PushKey> {
+        let key = (instance_id.to_string(), device_id.to_string());
+        let total = self.push_tokens.len() + usize::from(!self.push_tokens.contains_key(&key));
+        if total <= max.max(1) {
+            return Vec::new();
+        }
+        let mut entries: Vec<(&PushKey, u64)> = self
+            .push_tokens
+            .iter()
+            .filter(|(existing, _)| **existing != key)
+            .map(|(existing, entry)| (existing, entry.updated_at))
+            .collect();
+        entries.sort_by_key(|(key, updated_at)| (*updated_at, (*key).clone()));
+        let remove = (entries.len() + 1).saturating_sub(max.max(1));
+        entries
+            .into_iter()
+            .take(remove)
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
+    /// 这个来源 IP 的未授权注册额度是否已耗尽（耗尽 = 当前应直接拒，先别握手）。    ///
     /// 只读判定：按经过时间把令牌补满到上限后再看够不够一次；没有失败记录就不拦。
     pub fn reg_fail_throttled(&self, ip: &str, limits: &Limits, now: Instant) -> bool {
         let per_sec = refill_per_sec(limits);
@@ -446,11 +591,18 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn open(limits: Limits, token_path: &Path) -> io::Result<Self> {
+    pub fn open(limits: Limits, token_path: &Path, push_path: Option<&Path>) -> io::Result<Self> {
         let (store, tokens) = TokenStore::open(token_path)?;
         let mut inner = Inner::new(limits.reg_burst);
         inner.tokens = tokens;
         inner.token_store = Some(store);
+        // 推送令牌单独一份日志：地址目录是核心，推送是增强，但两者都不能「重启后静默丢一半」。
+        // 打不开就拒绝启动，和令牌文件同一条口径（部署目录写不了是必须人来看的事）。
+        if let Some(push_path) = push_path {
+            let (push_store, push_tokens) = PushStore::open(push_path)?;
+            inner.push_tokens = push_tokens;
+            inner.push_store = Some(push_store);
+        }
         Ok(Self {
             inner: Arc::new(RwLock::new(inner)),
             limits,

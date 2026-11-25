@@ -6,6 +6,7 @@ fn limits(max_devices: usize, reg_per_sec: f64, reg_burst: f64, max_tokens: usiz
     Limits {
         max_devices,
         max_tokens,
+        max_push_tokens: 1000,
         max_conns_per_ip: 50,
         reg_per_sec,
         reg_burst,
@@ -120,7 +121,7 @@ fn temp_path() -> std::path::PathBuf {
 async fn persistent_tokens_survive_restart_without_online_records() {
     let path = temp_path();
     let l = limits(100, 1000.0, 1000.0, 1000);
-    let state = AppState::open(l.clone(), &path).unwrap();
+    let state = AppState::open(l.clone(), &path, None).unwrap();
     let first = {
         let mut inner = state.inner.write().await;
         let token =
@@ -133,7 +134,7 @@ async fn persistent_tokens_survive_restart_without_online_records() {
         token
     };
     drop(state);
-    let state = AppState::open(l.clone(), &path).unwrap();
+    let state = AppState::open(l.clone(), &path, None).unwrap();
     assert_eq!(snapshot(&state, "a").await, (false, None));
     {
         let mut inner = state.inner.write().await;
@@ -175,7 +176,7 @@ async fn persistent_tokens_survive_restart_without_online_records() {
 async fn unknown_client_token_is_not_adopted_or_persisted() {
     let path = temp_path();
     let l = limits(100, 1000.0, 1000.0, 1000);
-    let state = AppState::open(l.clone(), &path).unwrap();
+    let state = AppState::open(l.clone(), &path, None).unwrap();
     let first = registered_token(state.inner.write().await.register(
         "new",
         1,
@@ -187,7 +188,7 @@ async fn unknown_client_token_is_not_adopted_or_persisted() {
     ));
     assert_ne!(first, "forged");
     drop(state);
-    let state = AppState::open(l.clone(), &path).unwrap();
+    let state = AppState::open(l.clone(), &path, None).unwrap();
     let inner = state.inner.read().await;
     assert_eq!(inner.tokens["new"].token, first);
     drop(inner);
@@ -199,7 +200,7 @@ async fn unknown_client_token_is_not_adopted_or_persisted() {
 async fn token_eviction_and_recent_registration_persist_across_restarts() {
     let path = temp_path();
     let l = limits(100, 1000.0, 1000.0, 2);
-    let state = AppState::open(l.clone(), &path).unwrap();
+    let state = AppState::open(l.clone(), &path, None).unwrap();
     {
         let mut inner = state.inner.write().await;
         let a = registered_token(inner.register("a", 1, "p".into(), tx(), None, 100, &l));
@@ -208,7 +209,7 @@ async fn token_eviction_and_recent_registration_persist_across_restarts() {
         registered_token(inner.register("c", 4, "p".into(), tx(), None, 400, &l));
     }
     drop(state);
-    let state = AppState::open(l, &path).unwrap();
+    let state = AppState::open(l, &path, None).unwrap();
     let inner = state.inner.read().await;
     assert!(inner.tokens.contains_key("a"));
     assert!(!inner.tokens.contains_key("b"));
@@ -222,7 +223,7 @@ async fn token_eviction_and_recent_registration_persist_across_restarts() {
 async fn failed_persistence_does_not_publish_or_evict_devices() {
     let path = temp_path();
     let l = limits(1, 1000.0, 1000.0, 1000);
-    let state = AppState::open(l.clone(), &path).unwrap();
+    let state = AppState::open(l.clone(), &path, None).unwrap();
     let original = registered_token(state.inner.write().await.register(
         "a",
         1,
@@ -247,7 +248,7 @@ async fn failed_persistence_does_not_publish_or_evict_devices() {
         assert!(!inner.devices.contains_key("b"));
     }
     drop(state);
-    let state = AppState::open(l, &path).unwrap();
+    let state = AppState::open(l, &path, None).unwrap();
     let inner = state.inner.read().await;
     assert_eq!(inner.tokens.len(), 1);
     assert_eq!(inner.tokens["a"].token, original);
@@ -488,4 +489,136 @@ fn idle_reg_fail_buckets_are_swept() {
         t0 + Duration::from_secs_f64(l.reg_fail_refill_secs * l.reg_fail_burst + 601.0);
     inner.sweep_reg_fails(&l, much_later);
     assert!(inner.fail_buckets.is_empty(), "长期无活动的失败桶应被清理");
+}
+
+fn push_entry(token: &str, env: &str, updated_at: u64) -> PushEntry {
+    PushEntry {
+        token: token.into(),
+        platform: "ios".into(),
+        env: env.into(),
+        updated_at,
+    }
+}
+
+fn temp_push_path() -> std::path::PathBuf {
+    std::env::temp_dir()
+        .join(format!("dsh-directory-push-state-{}", uuid::Uuid::new_v4()))
+        .join("push.jsonl")
+}
+
+#[tokio::test]
+async fn push_tokens_survive_restart() {
+    let token_path = temp_path();
+    let push_path = temp_push_path();
+    let l = limits(100, 1000.0, 1000.0, 1000);
+    let state = AppState::open(l.clone(), &token_path, Some(&push_path)).unwrap();
+    let instance_token = {
+        let mut inner = state.inner.write().await;
+        let token = registered_token(inner.register("a", 1, "addr".into(), tx(), None, 100, &l));
+        inner
+            .upsert_push_token("a", "phone", push_entry("t1", "production", 10), &l)
+            .unwrap();
+        token
+    };
+    drop(state);
+    let state = AppState::open(l.clone(), &token_path, Some(&push_path)).unwrap();
+    let inner = state.inner.read().await;
+    assert!(inner.verify_instance_token("a", &instance_token));
+    let targets = inner.push_targets_of("a", "");
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].1.token, "t1");
+    assert_eq!(targets[0].1.env, "production");
+}
+
+#[tokio::test]
+async fn dead_token_removal_survives_restart() {
+    let token_path = temp_path();
+    let push_path = temp_push_path();
+    let l = limits(100, 1000.0, 1000.0, 1000);
+    let state = AppState::open(l.clone(), &token_path, Some(&push_path)).unwrap();
+    {
+        let mut inner = state.inner.write().await;
+        inner
+            .upsert_push_token("a", "phone", push_entry("t1", "production", 10), &l)
+            .unwrap();
+        // 只删登记时那一枚：期间手机换了新令牌，旧结论不能把新记录删掉。
+        inner.delete_push_token_if_matches("a", "phone", "stale");
+        assert_eq!(inner.push_tokens.len(), 1);
+        inner.delete_push_token_if_matches("a", "phone", "t1");
+        assert!(inner.push_tokens.is_empty());
+    }
+    drop(state);
+    let state = AppState::open(l.clone(), &token_path, Some(&push_path)).unwrap();
+    assert!(state.inner.read().await.push_tokens.is_empty());
+}
+
+#[tokio::test]
+async fn push_env_follows_the_endpoint_that_answered() {
+    let path = temp_path();
+    let l = limits(100, 1000.0, 1000.0, 1000);
+    let state = AppState::open(l.clone(), &path, None).unwrap();
+    let mut inner = state.inner.write().await;
+    inner
+        .upsert_push_token("a", "phone", push_entry("t1", "production", 10), &l)
+        .unwrap();
+    // 令牌已经换过了：旧那一发得出的环境结论作废。
+    inner.set_push_env("a", "phone", "old-token", "sandbox", &l).unwrap();
+    assert_eq!(inner.push_tokens[&("a".into(), "phone".into())].env, "production");
+    inner.set_push_env("a", "phone", "t1", "sandbox", &l).unwrap();
+    assert_eq!(inner.push_tokens[&("a".into(), "phone".into())].env, "sandbox");
+}
+
+#[tokio::test]
+async fn push_targets_cover_all_devices_or_one() {
+    let path = temp_path();
+    let l = limits(100, 1000.0, 1000.0, 1000);
+    let state = AppState::open(l.clone(), &path, None).unwrap();
+    let mut inner = state.inner.write().await;
+    inner
+        .upsert_push_token("a", "phone-1", push_entry("t1", "production", 10), &l)
+        .unwrap();
+    inner
+        .upsert_push_token("a", "phone-2", push_entry("t2", "production", 20), &l)
+        .unwrap();
+    inner
+        .upsert_push_token("b", "phone-1", push_entry("t3", "production", 30), &l)
+        .unwrap();
+    assert_eq!(inner.push_targets_of("a", "").len(), 2);
+    let one = inner.push_targets_of("a", "phone-2");
+    assert_eq!(one.len(), 1);
+    assert_eq!(one[0].1.token, "t2");
+    assert_eq!(inner.push_targets_of("a", "phone-9").len(), 0);
+}
+
+#[tokio::test]
+async fn push_rate_limit_is_per_instance() {
+    let path = temp_path();
+    let l = limits(100, 1000.0, 1000.0, 1000);
+    let state = AppState::open(l.clone(), &path, None).unwrap();
+    let mut inner = state.inner.write().await;
+    let mut allowed = 0;
+    for _ in 0..100 {
+        if inner.push_allowed("a") {
+            allowed += 1;
+        }
+    }
+    assert_eq!(allowed, crate::push::PUSH_BURST as usize);
+    assert!(inner.push_allowed("b"), "别的实例不共用这个桶");
+}
+
+#[tokio::test]
+async fn push_token_table_evicts_least_recently_updated() {
+    let path = temp_path();
+    let mut l = limits(100, 1000.0, 1000.0, 1000);
+    l.max_push_tokens = 1;
+    let state = AppState::open(l.clone(), &path, None).unwrap();
+    let mut inner = state.inner.write().await;
+    inner
+        .upsert_push_token("a", "phone-1", push_entry("t1", "production", 10), &l)
+        .unwrap();
+    inner
+        .upsert_push_token("a", "phone-2", push_entry("t2", "production", 20), &l)
+        .unwrap();
+    assert_eq!(inner.push_tokens.len(), 1);
+    assert!(inner.push_tokens.contains_key(&("a".into(), "phone-2".into())));
 }

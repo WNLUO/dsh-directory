@@ -1,4 +1,5 @@
-# 总控服务：在线地址驻内存，令牌保存在systemd管理的持久目录。
+# 总控服务：在线地址驻内存，设备令牌与推送令牌都保存在systemd管理的持久目录。
+# 苹果离线推送的 APNS_* 配置放在 EnvironmentFile（dsh-directory.env）里，不写进这个单元。
 [Unit]
 Description=DSH Directory (public relay control plane / address directory)
 After=network-online.target
@@ -12,6 +13,7 @@ WorkingDirectory=/opt/dsh-directory
 StateDirectory=dsh-directory
 StateDirectoryMode=0700
 Environment=TOKEN_STORE_PATH=/var/lib/dsh-directory/tokens.jsonl
+Environment=PUSH_STORE_PATH=/var/lib/dsh-directory/push-tokens.jsonl
 EnvironmentFile=/opt/dsh-directory/dsh-directory.env
 ExecStart=/opt/dsh-directory/dsh-directory
 Restart=always

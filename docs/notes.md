@@ -72,3 +72,27 @@
 - 两侧测试：插件 `test/control-addresses.test.cjs`、`test/control-client.test.cjs`（含真 WebSocket 与加解密）；
   APP 侧 `tsc` 通过、相关守卫绿。后端定向测试覆盖令牌绑定/上限/限速/满载淘汰，以及令牌跨重启
   保留、在线记录不恢复、未知令牌不采信、持久写入失败、日志压缩与未完成尾记录恢复。
+
+## 苹果离线推送（2026-11-26 从 Rust 中转搬过来）
+
+推送从中转整块搬到总控：中转是「一人一台」（还有大量自建），苹果 `.p8` 密钥配在那儿等于每台
+都得配一遍，而且纯转发节点上配了也不生效。现在密钥只在总控这一台，任何中转（含自建）的用户都
+能收到通知。
+
+- 入口两个，都用设备那枚实例令牌鉴权（`Authorization: Bearer` + `X-Dsh-Instance`）：
+  APP 打 `POST /push/token` 报这台手机的 APNs 令牌；插件打 `POST /push/send` 请求发一条。
+  插件走 HTTPS 直连总控，不再经隧道帧（`pushRegister` / `pushSend` 两条帧已在中转与插件两侧退役）。
+- 存储：`(instanceId, deviceId) → {token, platform, env, updatedAt}` 追加日志落盘
+  （`PUSH_STORE_PATH`，默认 `data/push-tokens.jsonl`，权限 600），重放得到当前表，定期压缩；
+  删除也记一条（苹果说令牌失效时），重启后不会把死令牌带回来。`MAX_PUSH_TOKENS` 到线后按最久
+  未更新淘汰。
+- 推送一律带声音：App 侧的按事件分级 / 单会话静音已整体下线，声音与静音交给系统通知设置；
+  宿主侧也不再按 `notification-prefs` 拦推送。通知栏按钮由 `category` 决定。
+- 环境（沙盒 / 生产）：APP 不报环境时按生产记；真发时苹果回 `BadDeviceToken` 就换另一个端点
+  再试一次，成功即改记该设备的环境。所以 Xcode 直接装的开发版和 TestFlight / 商店版可以同时用，
+  不用手工切。`410 Unregistered` 直接摘令牌。
+- 配置（`dsh-directory.env`，权限 600，不入库）：`APNS_KEY`（.p8 内容或文件路径）、`APNS_KEY_ID`、
+  `APNS_TEAM_ID`、`APNS_TOPIC`（默认 `com.dsh.mobile`）。缺任何一样就是推送关闭：令牌照收、
+  地址目录照常，只是不发通知。密钥不过期（证书才一年一换），一把能推该团队全部 App。
+- 已知边界：令牌鉴权必须带 `apns-topic`（App 的 bundle id），换包名要一起改 `APNS_TOPIC`；
+  推送只能真机验，模拟器收不到。

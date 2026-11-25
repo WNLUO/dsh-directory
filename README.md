@@ -1,12 +1,14 @@
-<!-- 总控协议、令牌持久化和单实例部署约定。 -->
+<!-- 总控协议、令牌与推送令牌持久化、单实例部署约定。 -->
 # dsh-directory
 
-公用中转的**总控 / 地址目录**。只干一件事：知道「哪台设备现在挂在哪、能用哪些地址连它」。
+公用中转的**总控 / 地址目录**：知道「哪台设备现在挂在哪、能用哪些地址连它」，并代替所有中转
+给手机发苹果离线通知。
 
 - 设备（插件宿主）用长连接把当前所有可用地址报到总控；
 - APP 用长连接向总控查 / 订阅这些地址；
 - 地址没变化时**一个字都不推**，链路保持静默；
-- 在线地址与订阅只放内存；设备令牌独立落盘，重启后继续使用原令牌查询新上报的地址。
+- 在线地址与订阅只放内存；设备令牌独立落盘，重启后继续使用原令牌查询新上报的地址；
+- 苹果离线推送（APNs）也只在这里配一把密钥：APP 把推送令牌报上来，插件请求发通知。
 
 这是本项目的后端。以后要做的管理前端放在同一目录的另一个子文件夹里（例如 `web/`），
 和后端分开。
@@ -34,15 +36,21 @@ cargo run --release
 | --- | --- | --- |
 | `BIND` | 监听地址 | `0.0.0.0:8787` |
 | `TOKEN_STORE_PATH` | 设备令牌日志路径；目录须可写，现有文件读取失败则拒绝启动 | `data/tokens.jsonl` |
+| `PUSH_STORE_PATH` | 推送令牌日志路径；同样写不了就拒绝启动 | `data/push-tokens.jsonl` |
 | `MAX_DEVICES` | 设备记录总量上限 | `100000` |
 | `MAX_TOKENS` | 设备令牌记录总量上限（超出按最久未注册淘汰） | `200000` |
+| `MAX_PUSH_TOKENS` | 推送令牌记录总量上限（超出按最久未更新淘汰） | `200000` |
+| `APNS_KEY` | 苹果 `.p8` 内容或文件路径（`~/` 可用）；不配就是推送关闭 | 空 |
+| `APNS_KEY_ID` | `.p8` 对应的 Key ID（苹果后台 10 位） | 空 |
+| `APNS_TEAM_ID` | 团队 ID（Membership 页面 10 位） | 空 |
+| `APNS_TOPIC` | App 的 bundle id，即推送的 topic | `com.dsh.mobile` |
 | `MAX_CONNS_PER_IP` | 单来源 IP 的并发连接上限 | `50` |
 | `REG_RATE_PER_SEC` | 全局新注册速率（每秒） | `500` |
 | `REG_RATE_BURST` | 全局注册突发上限 | `1000` |
 | `REG_FAIL_BURST` | 单 IP 未授权注册的突发次数额度 | `5` |
 | `REG_FAIL_REFILL_SECS` | 额度用尽后，单 IP 每隔多少秒恢复一次尝试机会 | `300` |
 
-健康检查：`GET /healthz` → `{"ok":true,"devices":N,"watchers":M}`。
+健康检查：`GET /healthz` → `{"ok":true,"devices":N,"watchers":M,"push":true|false}`。
 
 ## 身份、加密与令牌
 
@@ -65,13 +73,15 @@ cargo run --release
 首次从纯内存版本升级时，没有可导入的历史令牌文件；插件会按原流程收到新令牌并转交 APP。
 升级后的后续重启只要保留令牌文件，就不再换令牌。
 
-## 端到端加密（总控是盲的）
+## 端到端加密（地址是盲的）
 
 - 复用历史离线 blob 那套：HK（32 字节）+ AES-256-GCM，信封 `{v:1,z:0,n,c}`，两端逐字节一致
   （插件 `lib/mirror/history-blob.cjs`、APP `services/viewmodels/history-blob.ts`）。
 - AAD 绑 `scope='control'` 与 `instanceId`：换设备、换用途都解不开，也防重放到别的实例。
 - **取舍**：总控既然解不开，就不能在服务端按地址做“挑哪台公用中转 / 编址”这类事——需要读地址的
   逻辑只能放在插件 / APP 侧。总控在这里只当“保底查询”的盲存储。
+- **例外是推送**：通知的标题与正文要给苹果，谁发推送谁就得看见它，所以总控看得到会话名、
+  审批摘要、提问原文这几类文字。地址那份载荷仍然是密文。
 
 ## 协议（WebSocket + JSON）
 
@@ -124,6 +134,28 @@ APP  → 总控   { "type": "ask" }
 - 设备不在总控上这件事本身就是结论：插件没跑、DSH 没开、电脑没出网，或用户关掉了自动上报。
   这个判断只在这里成立 —— 手机连不上插件，但插件在总控上活着，说明问题在地址 / 中转 / 防火墙那一侧。
 
+## 苹果离线推送
+
+推送只在这一层做：中转（含自建中转）既不用配苹果密钥，也不用管令牌。两个入口，都用设备那枚
+实例令牌鉴权（`Authorization: Bearer <token>` + `X-Dsh-Instance`，与查地址同一枚）：
+
+| 入口 | 谁打 | 正文 |
+| --- | --- | --- |
+| `POST /push/token` | APP | `{deviceId, token, platform?, env?}`：这台手机在这台电脑上的 APNs 令牌 |
+| `POST /push/send` | 插件 | `{title, body?, sessionId?, category?, interaction?}`：一条要发的通知 |
+
+- 令牌按 `(instanceId, deviceId)` 存一份，**不随设备断线删除**；同一台电脑可以有多台手机。
+- `POST /push/send` 推给该实例登记过的**全部**手机，触发点仍是宿主（任务收尾、审批 / 提问卡）。
+  响应只说「收到几条目标」，真正的发送在后台跑；每实例限一分钟 60 条、突发 20 条。
+- 载荷与中转时代一致：`aps.alert` + `sound`，`category` 决定通知栏按钮，`interaction` 原样进
+  顶层 `dshInteraction`。超 3800 字节先丢交互数据、再丢类别、最后截正文。
+- 环境：`env` 缺省按生产记。真发时苹果回 `BadDeviceToken` 就换另一个端点（沙盒 / 生产）再试一次，
+  成功就改记这台设备的环境——开发者拿手机自测不用手工切。`410 Unregistered` 直接摘掉令牌。
+- 推送令牌与设备令牌一样落盘，重启后继续用；苹果说令牌失效时才删。
+
+**这把密钥是全项目唯一的苹果凭据**：`.p8` 不过期、能推该团队全部 App，别提交进仓库，放
+`dsh-directory.env` 或服务器上的一个 600 文件里。
+
 ## 防滥用与容量
 
 注册没有额外口令，就靠「令牌绑定 + 容量上限 + 限速」把口子收住；令牌持久化，在线计数和限速驻内存：
@@ -160,8 +192,9 @@ APP  → 总控   { "type": "ask" }
   `dsh-directory` 常驻，只听 `127.0.0.1:8787`（不对公网暴露）。
 - 配置：`/opt/dsh-directory/dsh-directory.env`（`BIND` 等环境覆盖，权限 600，不入库）。
 - 令牌：systemd 单元通过 `StateDirectory` 创建 `/var/lib/dsh-directory`（服务用户可写、目录 700），
-  `TOKEN_STORE_PATH=/var/lib/dsh-directory/tokens.jsonl`；新文件权限 600。更新二进制或重启服务须保留
-  该目录，并纳入备份；不把令牌文件放进源码或发布包。容器部署须给该路径挂持久卷。
+  `TOKEN_STORE_PATH=/var/lib/dsh-directory/tokens.jsonl`、`PUSH_STORE_PATH=/var/lib/dsh-directory/push-tokens.jsonl`；
+  新文件权限 600。更新二进制或重启服务须保留该目录，并纳入备份；不把令牌文件放进源码或发布包。
+  容器部署须给该路径挂持久卷。
 - 入口：宝塔站点伪静态里加一段反代，把 `https://ai-hub.wnluo.com/findme/` 转到本机后端，
   支持 WebSocket。片段见 `deploy/nginx-location.conf`，systemd 单元见 `deploy/dsh-directory.service`。
 
